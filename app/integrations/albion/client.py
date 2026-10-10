@@ -60,6 +60,12 @@ class AlbionClient:
             raise AlbionAPIError("Formato inesperado ao consultar personagem.")
         return result
 
+    async def get_player_deaths(self, player_id: str) -> list[dict[str, Any]]:
+        result = await self._get(f"players/{player_id}/deaths")
+        if not isinstance(result, list):
+            raise AlbionAPIError("Formato inesperado nas mortes do personagem.")
+        return result
+
     async def get_guild(self, guild_id: str) -> dict[str, Any]:
         result = await self._get(f"guilds/{guild_id}")
         if not isinstance(result, dict):

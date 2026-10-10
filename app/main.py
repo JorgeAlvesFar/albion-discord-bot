@@ -27,7 +27,7 @@ class AlbionBot(commands.Bot):
             max_concurrency=settings.albion_max_concurrency,
             retry_attempts=settings.albion_retry_attempts,
         )
-        self.tracker = CombatTracker(self, self.albion, self.repos, settings.combat_poll_seconds)
+        self.tracker = CombatTracker(self, self.albion, self.repos, settings.combat_poll_seconds, settings.member_sync_seconds)
         await self.add_cog(ConfigurationCog(self, self.albion, self.repos, self.tracker))
         await self.add_cog(CombatCog(self, self.repos))
         await self.tree.sync()
