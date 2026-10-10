@@ -8,7 +8,7 @@ from app.core.logging import configure_logging
 from app.repositories.memory import MemoryRepositories
 from app.integrations.albion.client import AlbionClient
 from app.integrations.albion.prices import AlbionPriceClient
-from app.integrations.albion.regions import region_for
+from app.integrations.albion.regions import prices_url_for
 from app.modules.configuration.cog import ConfigurationCog
 from app.modules.combat_tracker.card import KillCardRenderer
 from app.modules.combat_tracker.service import CombatTracker
@@ -30,9 +30,8 @@ class AlbionBot(commands.Bot):
             max_concurrency=settings.albion_max_concurrency,
             retry_attempts=settings.albion_retry_attempts,
         )
-        region, prices_url = region_for(settings.albion_api_base_url)
-        self.card_renderer = KillCardRenderer(region, timeout=settings.albion_http_timeout)
-        self.prices = AlbionPriceClient(prices_url, timeout=settings.albion_http_timeout)
+        self.card_renderer = KillCardRenderer(timeout=settings.albion_http_timeout)
+        self.prices = AlbionPriceClient(prices_url_for(settings.albion_api_base_url), timeout=settings.albion_http_timeout)
         self.tracker = CombatTracker(
             self, self.albion, self.repos, settings.combat_poll_seconds,
             renderer=self.card_renderer, prices=self.prices,

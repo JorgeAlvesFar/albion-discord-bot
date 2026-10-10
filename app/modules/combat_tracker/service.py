@@ -215,7 +215,7 @@ class CombatTracker:
         timestamp = parse_timestamp(event.get("TimeStamp"))
         if self.renderer:
             try:
-                png = await self.renderer.render(event, kind, silver, timestamp)
+                png = await self.renderer.render(event, kind, silver)
             except Exception:
                 log.exception("Falha ao gerar o card do evento %s; enviando só texto.", event.get("EventId"))
             else:

@@ -1,11 +1,10 @@
 import io
-from datetime import datetime, timezone
 import httpx
 import pytest
 from PIL import Image
 from app.integrations.albion.prices import AlbionPriceClient
-from app.integrations.albion.regions import region_for
-from app.modules.combat_tracker.card import draw_card, event_items, format_short, item_key, victim_items
+from app.integrations.albion.regions import prices_url_for
+from app.modules.combat_tracker.card import _inventory_layout, draw_card, event_items, format_short, item_key, victim_items
 
 def _png(color) -> bytes:
     output = io.BytesIO()
@@ -36,19 +35,29 @@ def test_items_skip_empty_slots():
 def test_draw_card_renders_png_with_missing_icons():
     icons = {item_key(EVENT["Killer"]["Equipment"]["MainHand"]): _png((200, 0, 0, 255))}
     fame = Image.new("RGBA", (80, 64), (255, 0, 0, 255))
-    data = draw_card(EVENT, "kill", 1_332_470, datetime(2026, 10, 10, 4, 33, tzinfo=timezone.utc), "AMERICAS", icons, _png((0, 0, 255, 255)), fame)
+    data = draw_card(EVENT, "kill", 1_332_470, icons, _png((0, 0, 255, 255)), fame)
     image = Image.open(io.BytesIO(data))
     assert image.format == "PNG"
-    assert image.width == 720
+    assert image.width > image.height * 1.3
 
 def test_draw_card_without_silver_or_inventory():
     event = {**EVENT, "Victim": {**EVENT["Victim"], "Inventory": []}}
-    data = draw_card(event, "death", None, None, "EUROPE", {}, None, None)
-    assert Image.open(io.BytesIO(data)).height < 796
+    data = draw_card(event, "death", None, {}, None, None)
+    assert Image.open(io.BytesIO(data)).format == "PNG"
 
-def test_region_for_known_and_unknown_hosts():
-    assert region_for("https://gameinfo-ams.albiononline.com/api/gameinfo") == ("EUROPE", "https://europe.albion-online-data.com")
-    assert region_for("https://example.com")[0] == "AMERICAS"
+def test_inventory_shrinks_to_fit_two_rows_when_possible():
+    assert _inventory_layout(8, 880) == (64, 12)
+    size, cols = _inventory_layout(30, 880)
+    assert size < 64 and -(-30 // cols) <= 2
+    inventory = [{"Type": f"T4_ITEM_{i}", "Quality": 0, "Count": i} for i in range(48)]
+    event = {**EVENT, "Victim": {**EVENT["Victim"], "Inventory": inventory}}
+    size, cols = _inventory_layout(len(inventory), 880)
+    assert size == 36 and -(-48 // cols) == 3
+    assert Image.open(io.BytesIO(draw_card(event, "death", 0, {}, None, None))).format == "PNG"
+
+def test_prices_url_for_known_and_unknown_hosts():
+    assert prices_url_for("https://gameinfo-ams.albiononline.com/api/gameinfo") == "https://europe.albion-online-data.com"
+    assert prices_url_for("https://example.com") == "https://west.albion-online-data.com"
 
 @pytest.mark.asyncio
 async def test_price_estimate_uses_quality_then_any_quality():

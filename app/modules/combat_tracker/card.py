@@ -1,7 +1,6 @@
 import asyncio
 import io
 import logging
-from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -21,11 +20,13 @@ EQUIPMENT_GRID = (
     ("Potion", "Shoes", "Food"),
     (None, "Mount", None),
 )
-SLOT, INV_SLOT, GAP, PAD, MIDDLE, INV_PER_ROW = 88, 64, 8, 32, 96, 9
-HEADER_HEIGHT, STATS_HEIGHT = 172, 56
+# O Discord limita a altura das imagens de embed: um card mais largo que alto é exibido maior.
+WIDTH, PAD, SLOT, GAP, MIDDLE = 960, 40, 76, 8, 232
+GRID_TOP = 170
+INV_MAX_SLOT, INV_MIN_SLOT, INV_MAX_ROWS = 64, 36, 2
 
-BG, SLOT_BG, SLOT_LINE, LINE = (21, 22, 28), (36, 38, 46), (52, 55, 66), (48, 51, 61)
-WHITE, MUTED, DIM, GOLD = (242, 243, 245), (160, 165, 178), (120, 125, 138), (250, 204, 21)
+BG, PANEL, SLOT_BG, SLOT_LINE, LINE = (17, 18, 23), (24, 26, 32), (36, 38, 46), (52, 55, 66), (48, 51, 61)
+WHITE, MUTED, DIM, GOLD = (242, 243, 245), (160, 165, 178), (110, 115, 128), (250, 204, 21)
 GREEN, RED = (74, 222, 128), (239, 68, 68)
 
 ItemKey = tuple[str, int]
@@ -50,7 +51,7 @@ def event_items(event: dict[str, Any]) -> list[dict[str, Any]]:
     killer = event.get("Killer") or {}
     return _items((killer.get("Equipment") or {}).values()) + victim_items(event)
 
-# A fonte embutida no Pillow (Aileron) não tem acentos, por isso os rótulos do card são em inglês.
+# A fonte embutida no Pillow (Aileron) não tem acentos: os textos do card evitam letras acentuadas.
 @lru_cache(maxsize=None)
 def _font(size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default(size=size)
@@ -73,16 +74,32 @@ def _text(draw, xy, value, size, fill, bold=False, anchor="la"):
     # A fonte embutida não tem negrito; um contorno fino na mesma cor simula o peso.
     draw.text(xy, value, font=_font(size), fill=fill, anchor=anchor, stroke_width=1 if bold and size >= 20 else 0, stroke_fill=fill)
 
-def _spaced(draw, xy, value, size, fill, align_right=False, spacing=2):
+def _spaced(draw, xy, value, size, fill, align="left", spacing=3):
     font = _font(size)
     widths = [draw.textlength(char, font=font) for char in value]
+    total = sum(widths) + spacing * (len(value) - 1)
     x, y = xy
-    if align_right:
-        x -= sum(widths) + spacing * (len(value) - 1)
+    if align == "right":
+        x -= total
+    elif align == "center":
+        x -= total / 2
     for char, width in zip(value, widths):
         draw.text((x, y), char, font=font, fill=fill)
         draw.text((x + 0.5, y), char, font=font, fill=fill)
         x += width + spacing
+
+def _diamond(draw, cx, cy, radius, fill):
+    draw.polygon([(cx, cy - radius), (cx + radius, cy), (cx, cy + radius), (cx - radius, cy)], fill=fill)
+
+def _people_icon(height: int) -> Image.Image:
+    scale = 4
+    size = height * scale
+    image = Image.new("RGBA", (size * 3 // 2, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    for cx, radius, color in ((size * 0.38, size * 0.16, DIM), (size * 1.12, size * 0.16, DIM), (size * 0.75, size * 0.2, MUTED)):
+        draw.ellipse((cx - radius, size * 0.12, cx + radius, size * 0.12 + radius * 2), fill=color)
+        draw.pieslice((cx - radius * 1.9, size * 0.12 + radius * 2.1, cx + radius * 1.9, size * 0.12 + radius * 6), 180, 360, fill=color)
+    return image.resize((image.width // scale, image.height // scale), Image.LANCZOS)
 
 def _slot(canvas, draw, icon, x, y, size, count, count_size):
     draw.rounded_rectangle((x, y, x + size, y + size), radius=8, fill=SLOT_BG, outline=SLOT_LINE)
@@ -90,7 +107,7 @@ def _slot(canvas, draw, icon, x, y, size, count, count_size):
         return
     canvas.alpha_composite(icon.resize((size, size), Image.LANCZOS), (x, y))
     if count and count > 1:
-        draw.text((x + size - 8, y + size - 6), str(count), font=_font(count_size), fill="white", anchor="rs", stroke_width=3, stroke_fill="black")
+        draw.text((x + size - 7, y + size - 5), str(count), font=_font(count_size), fill="white", anchor="rs", stroke_width=3, stroke_fill="black")
 
 def _guild_line(entity: dict[str, Any]) -> str:
     guild = entity.get("GuildName") or "No guild"
@@ -101,12 +118,18 @@ def _ip(entity: dict[str, Any]) -> str:
     value = entity.get("AverageItemPower")
     return f"IP {round(value)}" if isinstance(value, (int, float)) else "IP ?"
 
+def _inventory_layout(count: int, box_w: int) -> tuple[int, int]:
+    """Maior slot (e colunas) que faz o inventário caber em até INV_MAX_ROWS linhas."""
+    for size in range(INV_MAX_SLOT, INV_MIN_SLOT - 1, -4):
+        cols = max(1, (box_w + GAP) // (size + GAP))
+        if -(-count // cols) <= INV_MAX_ROWS:
+            return size, cols
+    return INV_MIN_SLOT, max(1, (box_w + GAP) // (INV_MIN_SLOT + GAP))
+
 def draw_card(
     event: dict[str, Any],
     kind: str,
     silver: float | None,
-    timestamp: datetime | None,
-    region: str,
     icons: dict[ItemKey, bytes],
     silver_icon: bytes | None,
     fame_icon: Image.Image | None,
@@ -118,57 +141,33 @@ def draw_card(
     images = {key: _open(data) for key, data in icons.items()}
 
     grid_w, grid_h = 3 * SLOT + 2 * GAP, 4 * SLOT + 3 * GAP
-    width = PAD * 2 + grid_w * 2 + MIDDLE
-    inv_rows = (len(inventory) + INV_PER_ROW - 1) // INV_PER_ROW
-    inv_h = inv_rows * INV_SLOT + max(inv_rows - 1, 0) * GAP
-    height = 6 + HEADER_HEIGHT + STATS_HEIGHT + grid_h + PAD + (28 + 30 + inv_h + PAD if inventory else 0)
+    grid_bottom = GRID_TOP + grid_h
+    inv_size, inv_cols = _inventory_layout(len(inventory), WIDTH - 2 * PAD) if inventory else (0, 1)
+    inv_rows = -(-len(inventory) // inv_cols)
+    inv_top = grid_bottom + 72
+    height = inv_top + inv_rows * (inv_size + GAP) - GAP + 32 if inventory else grid_bottom + 36
 
-    canvas = Image.new("RGBA", (width, height), BG)
+    canvas = Image.new("RGBA", (WIDTH, height), BG)
     draw = ImageDraw.Draw(canvas)
-    draw.rectangle((0, 0, width, 5), fill=GREEN if kind == "kill" else RED)
+    draw.rounded_rectangle((12, 12, WIDTH - 12, height - 12), radius=14, fill=PANEL, outline=LINE)
+    center = WIDTH / 2
 
-    when = f" · {timestamp:%Y-%m-%d %H:%M} UTC" if timestamp else ""
-    _text(draw, (width - PAD, 30), f"{region}{when}", 13, MUTED, anchor="ra")
+    left, right = PAD, WIDTH - PAD
+    _spaced(draw, (left, 34), "KILLER", 14, GREEN)
+    _spaced(draw, (right, 34), "VICTIM", 14, RED, align="right")
+    _text(draw, (left, 56), str(killer.get("Name") or "?"), 36, WHITE, bold=True)
+    _text(draw, (right, 56), str(victim.get("Name") or "?"), 36, WHITE, bold=True, anchor="ra")
+    _spaced(draw, (left, 104), _guild_line(killer), 15, MUTED, spacing=2)
+    _spaced(draw, (right, 104), _guild_line(victim), 15, MUTED, align="right", spacing=2)
+    _text(draw, (left, 128), _ip(killer), 26, GREEN, bold=True)
+    _text(draw, (right, 128), _ip(victim), 26, RED, bold=True, anchor="ra")
+    _text(draw, (center, 82), "VS", 34, DIM, bold=True, anchor="mm")
+    draw.line((center - 150, 82, center - 42, 82), fill=LINE, width=2)
+    draw.line((center + 42, 82, center + 150, 82), fill=LINE, width=2)
 
-    left, right = PAD, width - PAD
-    _spaced(draw, (left, 64), "KILLER", 11, GREEN)
-    _spaced(draw, (right, 64), "VICTIM", 11, RED, align_right=True)
-    _text(draw, (left, 82), str(killer.get("Name") or "?"), 28, WHITE, bold=True)
-    _text(draw, (right, 82), str(victim.get("Name") or "?"), 28, WHITE, bold=True, anchor="ra")
-    _text(draw, (left, 120), _guild_line(killer), 13, MUTED)
-    _text(draw, (right, 120), _guild_line(victim), 13, MUTED, anchor="ra")
-    _text(draw, (left, 142), _ip(killer), 20, GREEN, bold=True)
-    _text(draw, (right, 142), _ip(victim), 20, RED, bold=True, anchor="ra")
-
-    y = 6 + HEADER_HEIGHT
-    participants = event.get("numberOfParticipants") or len(event.get("Participants") or [])
-    groups = [(_fit(fame_icon, 26) if fame_icon else None, f"{event.get('TotalVictimKillFame') or 0:,}", GOLD, " fame")]
-    if silver is not None:
-        silver_image = _open(silver_icon)
-        groups.append((_fit(silver_image, 30) if silver_image else None, f"~{format_short(silver)}", WHITE, " silver"))
-    groups.append((None, str(participants), WHITE, " participants"))
-    separator, icon_gap = 34, 8
-
-    def group_width(icon, value, _color, label):
-        return (icon.width + icon_gap if icon else 0) + draw.textlength(value, font=_font(18)) + draw.textlength(label, font=_font(15))
-
-    x = (width - (sum(group_width(*group) for group in groups) + separator * (len(groups) - 1))) / 2
-    middle_y = y + STATS_HEIGHT / 2 - 8
-    for index, (icon, value, color, label) in enumerate(groups):
-        if icon:
-            canvas.alpha_composite(icon, (int(x), int(middle_y - icon.height / 2)))
-            x += icon.width + icon_gap
-        draw.text((x, middle_y), value, font=_font(18), fill=color, anchor="lm")
-        x += draw.textlength(value, font=_font(18))
-        draw.text((x, middle_y), label, font=_font(15), fill=MUTED, anchor="lm")
-        x += draw.textlength(label, font=_font(15))
-        if index < len(groups) - 1:
-            draw.text((x + separator / 2, middle_y), "·", font=_font(18), fill=DIM, anchor="mm")
-            x += separator
-    y += STATS_HEIGHT
-
+    margin = (WIDTH - (grid_w * 2 + MIDDLE)) // 2
     for side, equipment in enumerate(sides):
-        x0 = PAD + side * (grid_w + MIDDLE)
+        x0 = margin + side * (grid_w + MIDDLE)
         for row_index, row in enumerate(EQUIPMENT_GRID):
             for col_index, slot_name in enumerate(row):
                 if slot_name is None:
@@ -176,20 +175,38 @@ def draw_card(
                 item = equipment.get(slot_name)
                 icon = images.get(item_key(item)) if isinstance(item, dict) and item.get("Type") else None
                 count = item.get("Count") if isinstance(item, dict) else None
-                _slot(canvas, draw, icon, x0 + col_index * (SLOT + GAP), y + row_index * (SLOT + GAP), SLOT, count, 22)
-    _text(draw, (width / 2, y + grid_h / 2), "VS", 22, DIM, bold=True, anchor="mm")
-    y += grid_h + PAD
+                _slot(canvas, draw, icon, x0 + col_index * (SLOT + GAP), GRID_TOP + row_index * (SLOT + GAP), SLOT, count, 20)
+
+    for line_x in (margin + grid_w + 18, WIDTH - margin - grid_w - 18):
+        draw.line((line_x, GRID_TOP + 8, line_x, grid_bottom - 8), fill=LINE, width=1)
+        _diamond(draw, line_x, GRID_TOP + grid_h / 2, 5, LINE)
+
+    participants = event.get("numberOfParticipants") or len(event.get("Participants") or [])
+    stats = [(_fit(fame_icon, 34) if fame_icon else None, f"{event.get('TotalVictimKillFame') or 0:,}", GOLD, "fama")]
+    if silver is not None:
+        silver_image = _open(silver_icon)
+        stats.append((_fit(silver_image, 34) if silver_image else None, f"~{format_short(silver)}", WHITE, "valor"))
+    stats.append((_people_icon(26), str(participants), WHITE, "participante" if participants == 1 else "participantes"))
+    block_h, separator_h = 88, 26
+    y = GRID_TOP + (grid_h - (len(stats) * block_h + (len(stats) - 1) * separator_h)) / 2
+    for index, (icon, value, color, label) in enumerate(stats):
+        if icon:
+            canvas.alpha_composite(icon, (int(center - icon.width / 2), int(y + 17 - icon.height / 2)))
+        _text(draw, (center, y + 52), value, 24, color, bold=True, anchor="mm")
+        _text(draw, (center, y + 76), label, 15, MUTED, anchor="mm")
+        y += block_h
+        if index < len(stats) - 1:
+            _diamond(draw, center, y + separator_h / 2, 4, DIM)
+            y += separator_h
 
     if inventory:
-        draw.line((PAD, y, width - PAD, y), fill=LINE, width=1)
-        y += 28
-        _text(draw, (width / 2, y), "VICTIM'S INVENTORY", 13, MUTED, anchor="mm")
-        y += 30
-        inv_w = min(len(inventory), INV_PER_ROW) * (INV_SLOT + GAP) - GAP
-        x0 = (width - inv_w) // 2
+        draw.line((PAD, grid_bottom + 24, WIDTH - PAD, grid_bottom + 24), fill=LINE, width=1)
+        _spaced(draw, (center, grid_bottom + 36), "ITENS CARREGADOS", 14, MUTED, align="center")
+        used_cols = min(inv_cols, len(inventory))
+        x0 = (WIDTH - (used_cols * (inv_size + GAP) - GAP)) // 2
         for index, item in enumerate(inventory):
-            row_index, col_index = divmod(index, INV_PER_ROW)
-            _slot(canvas, draw, images.get(item_key(item)), x0 + col_index * (INV_SLOT + GAP), y + row_index * (INV_SLOT + GAP), INV_SLOT, item.get("Count"), 18)
+            row_index, col_index = divmod(index, inv_cols)
+            _slot(canvas, draw, images.get(item_key(item)), x0 + col_index * (inv_size + GAP), inv_top + row_index * (inv_size + GAP), inv_size, item.get("Count"), max(13, inv_size // 4 + 2))
 
     output = io.BytesIO()
     canvas.convert("RGB").save(output, "PNG", optimize=True)
@@ -198,8 +215,7 @@ def draw_card(
 class KillCardRenderer:
     """Monta o card da kill/morte com os ícones oficiais, consultados sob demanda no render do Albion."""
 
-    def __init__(self, region: str, timeout: float = 10, max_concurrency: int = 8, cache_size: int = 1000):
-        self.region = region
+    def __init__(self, timeout: float = 10, max_concurrency: int = 8, cache_size: int = 1000):
         self.cache_size = cache_size
         self._client = httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "AlbionDiscordBot/0.1"})
         self._semaphore = asyncio.Semaphore(max_concurrency)
@@ -232,9 +248,9 @@ class KillCardRenderer:
         self._icons[key] = response.content
         return response.content
 
-    async def render(self, event: dict[str, Any], kind: str, silver: float | None, timestamp: datetime | None) -> bytes:
+    async def render(self, event: dict[str, Any], kind: str, silver: float | None) -> bytes:
         keys = sorted({item_key(item) for item in event_items(event)})
         results = await asyncio.gather(*(self._icon(item_type, quality) for item_type, quality in keys))
         icons = {key: data for key, data in zip(keys, results) if data}
         silver_icon = await self._icon(SILVER_ICON_TYPE, 0, 64) if silver is not None else None
-        return await asyncio.to_thread(draw_card, event, kind, silver, timestamp, self.region, icons, silver_icon, self._fame_icon)
+        return await asyncio.to_thread(draw_card, event, kind, silver, icons, silver_icon, self._fame_icon)
