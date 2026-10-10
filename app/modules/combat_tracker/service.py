@@ -1,10 +1,12 @@
 import asyncio
+import io
 import logging
 import re
 import time
 from datetime import datetime, timezone
 import discord
 from app.integrations.albion.client import AlbionAPIError
+from app.modules.combat_tracker.card import victim_items
 from app.repositories.models import CombatEventRecord
 
 log = logging.getLogger(__name__)
@@ -14,6 +16,8 @@ _EXTRA_FRACTION_DIGITS = re.compile(r"(\.\d{6})\d+")
 
 # O endpoint events?guildId= só traz kills da guilda; mortes exigem uma consulta por membro.
 MAX_DEATH_LOOKUPS_PER_CYCLE = 25
+CARD_FILENAME = "combate.png"
+TITLES = {"kill": "⚔️ Kill da guilda", "death": "💀 Morte da guilda"}
 
 def parse_timestamp(value):
     if not value:
@@ -31,8 +35,9 @@ def _guild_id(entity):
     return str(entity.get("GuildId")) if isinstance(entity, dict) and entity.get("GuildId") else None
 
 class CombatTracker:
-    def __init__(self, bot, albion, repos, poll_seconds=45, member_sync_seconds=900):
+    def __init__(self, bot, albion, repos, poll_seconds=45, member_sync_seconds=900, renderer=None, prices=None):
         self.bot, self.albion, self.repos = bot, albion, repos
+        self.renderer, self.prices = renderer, prices
         self.poll_seconds = max(30, min(60, poll_seconds))
         self.member_sync_seconds = member_sync_seconds
         self._task = None
@@ -229,6 +234,7 @@ class CombatTracker:
             log.debug("Evento %s já publicado; ignorando.", event_id)
             return
         all_sent = True
+        silver = await self.prices.estimate_value(victim_items(event)) if self.renderer and self.prices else None
         for kind, channel_id in kinds:
             if kind in stored.message_ids:
                 continue
@@ -237,8 +243,9 @@ class CombatTracker:
                 log.warning("Canal inválido/indisponível (%s, tipo=%s) para evento %s.", channel_id, type(channel).__name__, event_id)
                 all_sent = False
                 continue
+            embed, file = await self._build_message(event, kind, silver)
             try:
-                message = await channel.send(embed=self._make_embed(event, kind))
+                message = await channel.send(embed=embed, file=file)
                 log.info("Evento %s (%s) publicado em #%s (%s), mensagem %s.", event_id, kind, channel.name, channel_id, message.id)
                 await self.repos.update_event(cfg.discord_guild_id, event_id, "PENDING", message.id, kind)
                 stored = await self.repos.get_event(cfg.discord_guild_id, event_id)
@@ -248,11 +255,30 @@ class CombatTracker:
         if all_sent:
             await self.repos.update_event(cfg.discord_guild_id, event_id, "PUBLISHED")
 
+    async def _build_message(self, event: dict, kind: str, silver: float | None) -> tuple[discord.Embed, discord.File | None]:
+        timestamp = parse_timestamp(event.get("TimeStamp"))
+        if self.renderer:
+            try:
+                png = await self.renderer.render(event, kind, silver, timestamp)
+            except Exception:
+                log.exception("Falha ao gerar o card do evento %s; enviando só texto.", event.get("EventId"))
+            else:
+                embed = discord.Embed(title=TITLES[kind], color=self._color(kind))
+                embed.set_image(url=f"attachment://{CARD_FILENAME}")
+                if timestamp:
+                    embed.timestamp = timestamp
+                embed.set_footer(text=f"Event ID: {event.get('EventId', 'desconhecido')}")
+                return embed, discord.File(io.BytesIO(png), filename=CARD_FILENAME)
+        return self._make_embed(event, kind), None
+
+    @staticmethod
+    def _color(kind: str) -> discord.Color:
+        return discord.Color.green() if kind == "kill" else discord.Color.red()
+
     def _make_embed(self, event: dict, kind: str) -> discord.Embed:
         killer = event.get("Killer") or {}
         victim = event.get("Victim") or {}
-        title = "⚔️ Kill da guilda" if kind == "kill" else "💀 Morte da guilda"
-        embed = discord.Embed(title=title, color=discord.Color.green() if kind == "kill" else discord.Color.red())
+        embed = discord.Embed(title=TITLES[kind], color=self._color(kind))
         embed.add_field(name="Killer", value=self._entity(killer), inline=True)
         embed.add_field(name="Vítima", value=self._entity(victim), inline=True)
         if event.get("KillFame") is not None:

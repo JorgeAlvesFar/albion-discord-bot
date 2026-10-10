@@ -36,6 +36,7 @@ Em `/configurar`, pesquise a guilda pelo nome e selecione explicitamente um resu
 - **Configuração pós-reinício:** como não há persistência, configure novamente a guilda e o tracker depois de reiniciar.
 - O cadastro completo de membros, recrutamento, sincronização automática de cargos/apelidos e opt-in PvE/PvP ainda não estão implementados nesta entrega; a arquitetura deixa esses módulos para as próximas etapas. Não considere esses recursos concluídos.
 - A API real pode alterar contratos, limites ou formatos de resposta. Erros são registrados e não substituídos por dados inventados.
+- **Card de kill/morte:** os ícones dos itens são consultados a cada evento em `render.albiononline.com`, sem cópia local. A prata é uma **estimativa** pelos preços de mercado do [Albion Online Data Project](https://www.albion-online-data.com/); itens sem oferta de venda entram como zero. Os rótulos do card são em inglês porque a fonte embutida no Pillow não tem acentos. Se a imagem falhar, a mensagem sai em texto.
 
 ## Testes
 Instale as dependências e execute:
@@ -47,5 +48,7 @@ Os testes unitários usam mocks HTTP apenas dentro dos testes. O bot em execuç�
 - `app/integrations/albion/client.py`: cliente HTTP real.
 - `app/repositories/`: contratos e implementação em memória.
 - `app/modules/configuration/`: interface de configuração Discord.
-- `app/modules/combat_tracker/`: polling, paginação, deduplicação e publicação.
+- `app/modules/combat_tracker/`: polling, paginação, deduplicação, card de kill/morte e publicação.
+- `app/integrations/albion/prices.py`: estimativa de prata pelos preços de mercado.
+- `app/assets/fame.png`: ícone de fama usado no card.
 - `tests/`: testes unitários sem depender da disponibilidade da API.
