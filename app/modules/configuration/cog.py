@@ -11,6 +11,37 @@ log = logging.getLogger(__name__)
 def _admin(interaction: discord.Interaction) -> bool:
     return bool(interaction.guild and interaction.user.guild_permissions.administrator)
 
+async def _log_saved_config(repos, discord_guild_id: int, action: str, user) -> None:
+    saved = await repos.get_config(discord_guild_id)
+    if not saved:
+        log.error("Configuração não encontrada após salvar (%s) DiscordGuildId=%s.", action, discord_guild_id)
+        return
+    log.info(
+        "Configuração salva (%s) por %s (%s): DiscordGuildId=%s AlbionGuild=%s (%s) Aliança=%s "
+        "tracker_ativo=%s config_válida=%s kills=%s canal_kills=%s mortes=%s canal_mortes=%s ativado_em=%s",
+        action, user, user.id, saved.discord_guild_id, saved.albion_guild_name, saved.albion_guild_id, saved.alliance_name,
+        saved.combat_enabled, saved.combat_config_valid, saved.kills_enabled, saved.kills_channel_id,
+        saved.deaths_enabled, saved.deaths_channel_id, saved.activated_at.isoformat() if saved.activated_at else None,
+    )
+
+def _tracker_config_embed(cfg: ServerConfig, user) -> discord.Embed:
+    embed = discord.Embed(title="✅ Tracker de combate configurado", color=discord.Color.green(), timestamp=cfg.activated_at)
+    embed.add_field(name="Guilda Albion", value=cfg.albion_guild_name or "Não informada", inline=True)
+    embed.add_field(name="Aliança", value=cfg.alliance_name or "Sem aliança", inline=True)
+    embed.add_field(name="Guild ID", value=f"`{cfg.albion_guild_id}`", inline=True)
+    embed.add_field(name="Canal de kills", value=f"<#{cfg.kills_channel_id}>" if cfg.kills_channel_id else "Desabilitado", inline=True)
+    embed.add_field(name="Canal de mortes", value=f"<#{cfg.deaths_channel_id}>" if cfg.deaths_channel_id else "Desabilitado", inline=True)
+    embed.add_field(name="Configurado por", value=user.mention, inline=True)
+    warnings = []
+    if not cfg.kills_channel_id:
+        warnings.append("Kills não serão publicadas (nenhum canal escolhido).")
+    if not cfg.deaths_channel_id:
+        warnings.append("Mortes não serão publicadas (nenhum canal escolhido).")
+    warnings.append("A configuração fica em memória e é perdida se o bot reiniciar.")
+    embed.add_field(name="Avisos", value="\n".join(warnings), inline=False)
+    embed.set_footer(text="Eventos anteriores à ativação serão ignorados.")
+    return embed
+
 class GuildSearchModal(discord.ui.Modal, title="Pesquisar guilda do Albion"):
     name = discord.ui.TextInput(label="Nome da guilda", placeholder="Digite o nome para pesquisar", max_length=100)
 
@@ -89,6 +120,7 @@ class ConfirmGuildView(discord.ui.View):
         cfg.combat_enabled = False
         cfg.activated_at = None
         await self.cog.repos.save_config(cfg)
+        await _log_saved_config(self.cog.repos, self.discord_guild_id, "guilda", interaction.user)
         await interaction.response.edit_message(content=f"Guilda salva: **{cfg.albion_guild_name}** (`{cfg.albion_guild_id}`). O tracker continua desativado.", view=None)
 
     @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
@@ -149,14 +181,16 @@ class CombatConfigView(discord.ui.View):
         cfg.activated_at = datetime.now(timezone.utc)
         cfg.updated_at = datetime.now(timezone.utc)
         await self.cog.repos.save_config(cfg)
-        summary = "\n".join(
-            f"{label}: <#{channel_id}>" if channel_id else f"{label}: desabilitado"
-            for label, channel_id in (("Kills", self.kills_channel_id), ("Mortes", self.deaths_channel_id))
-        )
-        await interaction.response.edit_message(
-            content=f"Tracker ativado com configuração validada.\n{summary}\nEventos anteriores ao instante de ativação serão ignorados.",
-            view=None,
-        )
+        await _log_saved_config(self.cog.repos, self.discord_guild_id, "tracker", interaction.user)
+        await interaction.response.edit_message(content="Tracker ativado. A configuração foi publicada neste canal.", view=None)
+        try:
+            await interaction.channel.send(embed=_tracker_config_embed(cfg, interaction.user))
+        except (discord.Forbidden, discord.HTTPException):
+            log.exception("Falha ao publicar a configuração do tracker no canal %s.", interaction.channel_id)
+            await interaction.followup.send(
+                "O tracker foi ativado, mas não consegui publicar a configuração neste canal. Verifique se o bot pode enviar mensagens e incorporar links aqui.",
+                ephemeral=True,
+            )
 
     @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary, row=2)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
