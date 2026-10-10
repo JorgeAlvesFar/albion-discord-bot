@@ -95,57 +95,72 @@ class ConfirmGuildView(discord.ui.View):
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="Configuração cancelada.", view=None)
 
-class CombatConfigModal(discord.ui.Modal, title="Configurar tracker de combate"):
-    kills_channel = discord.ui.TextInput(label="ID do canal de kills (vazio = desabilitado)", required=False, max_length=25)
-    deaths_channel = discord.ui.TextInput(label="ID do canal de mortes (vazio = desabilitado)", required=False, max_length=25)
-    kills_enabled = discord.ui.TextInput(label="Notificar kills? (sim/não)", default="sim", max_length=3)
-    deaths_enabled = discord.ui.TextInput(label="Notificar mortes? (sim/não)", default="sim", max_length=3)
+TEXT_CHANNEL_TYPES = [discord.ChannelType.text, discord.ChannelType.news]
 
-    def __init__(self, cog):
-        super().__init__()
+class CombatConfigView(discord.ui.View):
+    def __init__(self, cog, discord_guild_id: int):
+        super().__init__(timeout=180)
         self.cog = cog
+        self.discord_guild_id = discord_guild_id
+        self.kills_channel_id: int | None = None
+        self.deaths_channel_id: int | None = None
 
-    async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.guild or not _admin(interaction):
-            await interaction.response.send_message("Somente administradores podem alterar esta configuração.", ephemeral=True)
-            return
-        cfg = await self.cog.repos.get_config(interaction.guild.id)
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.guild or interaction.guild.id != self.discord_guild_id or not _admin(interaction):
+            await interaction.response.send_message("Ação não autorizada.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=TEXT_CHANNEL_TYPES, placeholder="Canal de kills", min_values=0, max_values=1, row=0)
+    async def kills_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        self.kills_channel_id = select.values[0].id if select.values else None
+        await interaction.response.defer()
+
+    @discord.ui.select(cls=discord.ui.ChannelSelect, channel_types=TEXT_CHANNEL_TYPES, placeholder="Canal de mortes", min_values=0, max_values=1, row=1)
+    async def deaths_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        self.deaths_channel_id = select.values[0].id if select.values else None
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Ativar tracker", style=discord.ButtonStyle.success, row=2)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cfg = await self.cog.repos.get_config(self.discord_guild_id)
         if not cfg or not cfg.albion_guild_id:
             await interaction.response.send_message("Configure e confirme a guilda do Albion primeiro com `/configurar`.", ephemeral=True)
             return
-        kill_on = str(self.kills_enabled).strip().lower() in {"sim", "s", "yes", "true"}
-        death_on = str(self.deaths_enabled).strip().lower() in {"sim", "s", "yes", "true"}
-        kill_id = str(self.kills_channel).strip()
-        death_id = str(self.deaths_channel).strip()
-        kill_channel = None
-        death_channel = None
-        try:
-            if kill_on:
-                kill_channel = interaction.guild.get_channel(int(kill_id))
-                if not isinstance(kill_channel, discord.TextChannel):
-                    raise ValueError("O canal de kills precisa ser um canal de texto válido.")
-            if death_on:
-                death_channel = interaction.guild.get_channel(int(death_id))
-                if not isinstance(death_channel, discord.TextChannel):
-                    raise ValueError("O canal de mortes precisa ser um canal de texto válido.")
-            for channel in [c for c in (kill_channel, death_channel) if c]:
-                perms = channel.permissions_for(interaction.guild.me)
-                if not perms.view_channel or not perms.send_messages or not perms.embed_links:
-                    raise ValueError(f"Permissões insuficientes em #{channel.name}: ver canal, enviar mensagens e incorporar links.")
-            if not kill_on and not death_on:
-                raise ValueError("Habilite kills, mortes ou ambos.")
-        except (ValueError, TypeError) as exc:
-            await interaction.response.send_message(f"Configuração inválida: {exc}", ephemeral=True)
+        if self.kills_channel_id is None and self.deaths_channel_id is None:
+            await interaction.response.send_message("Escolha pelo menos um canal: kills, mortes ou ambos.", ephemeral=True)
             return
-        cfg.kills_enabled = kill_on
-        cfg.deaths_enabled = death_on
-        cfg.kills_channel_id = int(kill_id) if kill_on else None
-        cfg.deaths_channel_id = int(death_id) if death_on else None
+        for kind, channel_id in (("kills", self.kills_channel_id), ("mortes", self.deaths_channel_id)):
+            if channel_id is None:
+                continue
+            channel = interaction.guild.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                await interaction.response.send_message(f"O canal de {kind} não está mais disponível. Escolha outro.", ephemeral=True)
+                return
+            perms = channel.permissions_for(interaction.guild.me)
+            if not perms.view_channel or not perms.send_messages or not perms.embed_links:
+                await interaction.response.send_message(f"Permissões insuficientes em {channel.mention}: ver canal, enviar mensagens e incorporar links.", ephemeral=True)
+                return
+        cfg.kills_enabled = self.kills_channel_id is not None
+        cfg.deaths_enabled = self.deaths_channel_id is not None
+        cfg.kills_channel_id = self.kills_channel_id
+        cfg.deaths_channel_id = self.deaths_channel_id
         cfg.combat_enabled = True
         cfg.activated_at = datetime.now(timezone.utc)
         cfg.updated_at = datetime.now(timezone.utc)
         await self.cog.repos.save_config(cfg)
-        await interaction.response.send_message("Tracker ativado com configuração validada. Eventos anteriores ao instante de ativação serão ignorados.", ephemeral=True)
+        summary = "\n".join(
+            f"{label}: <#{channel_id}>" if channel_id else f"{label}: desabilitado"
+            for label, channel_id in (("Kills", self.kills_channel_id), ("Mortes", self.deaths_channel_id))
+        )
+        await interaction.response.edit_message(
+            content=f"Tracker ativado com configuração validada.\n{summary}\nEventos anteriores ao instante de ativação serão ignorados.",
+            view=None,
+        )
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary, row=2)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Configuração do tracker cancelada.", view=None)
 
 class ConfigurationCog(commands.Cog):
     def __init__(self, bot, albion, repos, tracker):
@@ -177,4 +192,12 @@ class ConfigurationView(discord.ui.View):
         if not _admin(interaction):
             await interaction.response.send_message("Ação não autorizada.", ephemeral=True)
             return
-        await interaction.response.send_modal(CombatConfigModal(self.cog))
+        cfg = await self.cog.repos.get_config(interaction.guild.id)
+        if not cfg or not cfg.albion_guild_id:
+            await interaction.response.send_message("Configure e confirme a guilda do Albion primeiro em **Pesquisar/alterar guilda**.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"**Tracker de combate — {cfg.albion_guild_name}**\nEscolha onde as kills e as mortes serão publicadas.",
+            view=CombatConfigView(self.cog, interaction.guild.id),
+            ephemeral=True,
+        )
