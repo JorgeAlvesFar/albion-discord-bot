@@ -22,17 +22,19 @@ class GuildSearchModal(discord.ui.Modal, title="Pesquisar guilda do Albion"):
         if not interaction.guild or not _admin(interaction):
             await interaction.response.send_message("Somente administradores deste servidor podem configurar o bot.", ephemeral=True)
             return
+        # O Discord invalida a interação se não houver resposta em 3s; a API do Albion pode demorar mais.
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             result = await self.cog.albion.search(str(self.name).strip())
         except AlbionAPIError:
-            await interaction.response.send_message("A API do Albion falhou. A configuração não foi alterada; tente novamente mais tarde.", ephemeral=True)
+            await interaction.followup.send("A API do Albion falhou. A configuração não foi alterada; tente novamente mais tarde.", ephemeral=True)
             return
         guilds = result.get("guilds", [])
         if not guilds:
-            await interaction.response.send_message("Nenhuma guilda encontrada. Confira o nome e tente novamente.", ephemeral=True)
+            await interaction.followup.send("Nenhuma guilda encontrada. Confira o nome e tente novamente.", ephemeral=True)
             return
         view = GuildResultsView(self.cog, interaction.guild.id, guilds[:25])
-        await interaction.response.send_message("Selecione a guilda correta. Confira o nome e o ID antes de confirmar.", view=view, ephemeral=True)
+        await interaction.followup.send("Selecione a guilda correta. Confira o nome e o ID antes de confirmar.", view=view, ephemeral=True)
 
 class GuildResultsView(discord.ui.View):
     def __init__(self, cog, discord_guild_id: int, results: list[dict]):

@@ -1,8 +1,4 @@
-import asyncio
 import logging
-from dotenv import load_dotenv
-
-load_dotenv()  # Carrega o .env antes de importar as configurações.
 
 import discord
 from discord.ext import commands
@@ -53,6 +49,3 @@ async def main():
     bot = AlbionBot(command_prefix="!", intents=intents)
     async with bot:
         await bot.start(settings.discord_token)
-
-if __name__ == "__main__":
-    asyncio.run(main())

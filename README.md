@@ -18,7 +18,7 @@ No Developer Portal, habilite **Server Members Intent** se for usar recursos de 
    `pip install -r requirements.txt`
 4. Copie `.env.example` para `.env` e preencha `DISCORD_TOKEN`.
 5. Execute:
-   `python -m app.main`
+   `python main.py`
 
 Não compartilhe o `.env` nem publique o token. Se o painel tiver campo próprio para variáveis de ambiente, prefira usá-lo em vez de enviar o arquivo `.env`.
 

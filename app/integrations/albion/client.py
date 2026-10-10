@@ -46,7 +46,10 @@ class AlbionClient:
         raise AlbionAPIError(f"Falha ao consultar API do Albion ({path}).") from last_error
 
     async def search(self, name: str) -> dict[str, Any]:
-        result = await self._get("search", {"q": name})
+        params = {"q": name}
+        uri = self._client.build_request("GET", f"{self.base_url}/search", params=params).url
+        log.info("Pesquisa Albion: termo=%r uri=%s", name, uri)
+        result = await self._get("search", params)
         if not isinstance(result, dict):
             raise AlbionAPIError("Formato inesperado na pesquisa.")
         return result
