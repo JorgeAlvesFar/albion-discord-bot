@@ -39,7 +39,7 @@ def _tracker_config_embed(cfg: ServerConfig, user) -> discord.Embed:
         warnings.append("Mortes não serão publicadas (nenhum canal escolhido).")
     warnings.append("A configuração fica em memória e é perdida se o bot reiniciar.")
     embed.add_field(name="Avisos", value="\n".join(warnings), inline=False)
-    embed.set_footer(text="A última kill e a última morte já registradas serão publicadas agora; depois, só eventos novos.")
+    embed.set_footer(text="Serão publicados os eventos que aparecerem a partir de agora.")
     return embed
 
 class GuildSearchModal(discord.ui.Modal, title="Pesquisar guilda do Albion"):

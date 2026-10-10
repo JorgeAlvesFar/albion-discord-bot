@@ -31,6 +31,7 @@ Em `/configurar`, pesquise a guilda pelo nome e selecione explicitamente um resu
 
 ## Limitações importantes desta entrega
 - **Persistência em memória:** configurações, vínculos e histórico são perdidos ao reiniciar o processo. Não há PostgreSQL nesta versão.
+- **Fonte dos eventos:** o tracker lê o feed global de eventos (`/events`), que fica a poucos minutos do jogo, e filtra a guilda como killer ou vítima. Os endpoints filtrados (`events?guildId=`, `players/{id}/deaths`) chegam a atrasar horas e não são usados. Ao ligar, a primeira leitura do feed só marca eventos como vistos; depois, cada ciclo lê do topo até encontrar a leitura anterior. O feed só permite voltar ~1.050 eventos; se o bot ficar parado ou a API falhar por muito tempo em horário de pico, eventos mais antigos que isso se perdem.
 - **API de combate:** a API comunitária do Albion não oferece aqui uma garantia formal de captura de 100%. A paginação, a janela de sobreposição e a deduplicação reduzem riscos, mas precisam ser observadas em operação real.
 - **Sem entrega exatamente uma vez:** uma falha entre o envio ao Discord e a atualização do estado local pode causar uma publicação repetida após retentativa.
 - **Configuração pós-reinício:** como não há persistência, configure novamente a guilda e o tracker depois de reiniciar.
@@ -46,7 +47,7 @@ Os testes unitários usam mocks HTTP apenas dentro dos testes. O bot em execuç�
 
 ## Estrutura
 - `app/integrations/albion/client.py`: cliente HTTP real.
-- `app/repositories/`: contratos e implementação em memória.
+- `app/repositories/`: modelos e implementação em memória.
 - `app/modules/configuration/`: interface de configuração Discord.
 - `app/modules/combat_tracker/`: polling, paginação, deduplicação, card de kill/morte e publicação.
 - `app/integrations/albion/prices.py`: estimativa de prata pelos preços de mercado.

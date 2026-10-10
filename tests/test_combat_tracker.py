@@ -1,4 +1,4 @@
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from app.modules.combat_tracker.service import parse_timestamp, _guild_id
 
 def test_parse_timestamp_utc():

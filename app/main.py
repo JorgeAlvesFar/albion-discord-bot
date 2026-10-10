@@ -34,7 +34,7 @@ class AlbionBot(commands.Bot):
         self.card_renderer = KillCardRenderer(region, timeout=settings.albion_http_timeout)
         self.prices = AlbionPriceClient(prices_url, timeout=settings.albion_http_timeout)
         self.tracker = CombatTracker(
-            self, self.albion, self.repos, settings.combat_poll_seconds, settings.member_sync_seconds,
+            self, self.albion, self.repos, settings.combat_poll_seconds,
             renderer=self.card_renderer, prices=self.prices,
         )
         await self.add_cog(ConfigurationCog(self, self.albion, self.repos, self.tracker))

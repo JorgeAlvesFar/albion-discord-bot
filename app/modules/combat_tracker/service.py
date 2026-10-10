@@ -2,7 +2,7 @@ import asyncio
 import io
 import logging
 import re
-import time
+from collections import deque
 from datetime import datetime, timezone
 import discord
 from app.integrations.albion.client import AlbionAPIError
@@ -14,8 +14,11 @@ log = logging.getLogger(__name__)
 # A API do Albion envia até 7 casas decimais nos segundos; datetime aceita no máximo 6.
 _EXTRA_FRACTION_DIGITS = re.compile(r"(\.\d{6})\d+")
 
-# O endpoint events?guildId= só traz kills da guilda; mortes exigem uma consulta por membro.
-MAX_DEATH_LOOKUPS_PER_CYCLE = 25
+# Os endpoints filtrados (events?guildId=, players/{id}/deaths) chegam a ficar horas atrasados;
+# o feed global de eventos fica a poucos minutos do jogo, por isso é a fonte dos eventos.
+FEED_PAGE_SIZE = 51
+FEED_MAX_OFFSET = 1000
+SEEN_EVENTS_LIMIT = 20000
 CARD_FILENAME = "combate.png"
 TITLES = {"kill": "⚔️ Kill da guilda", "death": "💀 Morte da guilda"}
 
@@ -35,16 +38,18 @@ def _guild_id(entity):
     return str(entity.get("GuildId")) if isinstance(entity, dict) and entity.get("GuildId") else None
 
 class CombatTracker:
-    def __init__(self, bot, albion, repos, poll_seconds=45, member_sync_seconds=900, renderer=None, prices=None):
+    def __init__(self, bot, albion, repos, poll_seconds=45, renderer=None, prices=None):
         self.bot, self.albion, self.repos = bot, albion, repos
         self.renderer, self.prices = renderer, prices
         self.poll_seconds = max(30, min(60, poll_seconds))
-        self.member_sync_seconds = member_sync_seconds
         self._task = None
-        self._locks = {}
-        self._initial_published: set[tuple[int, datetime]] = set()
-        self._members: dict[int, tuple[str, float, list[dict]]] = {}
-        self._member_cursor: dict[int, int] = {}
+        self._seen_ids: set[int] = set()
+        self._seen_order: deque[int] = deque()
+        self._feed_ready = False
+        # EventIds abaixo do piso são histórico anterior à primeira leitura (ou já esquecido) e nunca são publicados.
+        self._feed_floor = 0
+        # Eventos lidos numa leitura interrompida: não servem de ponto de parada, porque abaixo deles pode haver eventos ainda não lidos.
+        self._unconfirmed_ids: set[int] = set()
 
     def start(self):
         if self._task is None or self._task.done():
@@ -63,153 +68,104 @@ class CombatTracker:
         log.info("Tracker de combate iniciado (intervalo de %ss).", self.poll_seconds)
         while not self.bot.is_closed():
             try:
+                # O feed é lido a cada ciclo mesmo sem servidores ativos, para que uma ativação não publique o histórico.
+                new_events = await self._scan_feed()
                 configs = await self.repos.all_configs()
                 active = [cfg for cfg in configs if cfg.combat_config_valid]
                 log.info("Ciclo do tracker: %s servidor(es) configurado(s), %s com tracker ativo.", len(configs), len(active))
                 for cfg in active:
-                    lock = self._locks.setdefault(cfg.discord_guild_id, asyncio.Lock())
-                    if lock.locked():
-                        log.info("DiscordGuildId=%s ainda está em consulta do ciclo anterior; pulando.", cfg.discord_guild_id)
-                        continue
-                    async with lock:
-                        await self._poll_guild(cfg)
+                    try:
+                        await self._poll_guild(cfg, new_events)
+                    except Exception:
+                        log.exception("Erro ao processar eventos de DiscordGuildId=%s.", cfg.discord_guild_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("Erro não previsto no ciclo do tracker.")
             await asyncio.sleep(self.poll_seconds)
 
-    async def _fetch_kill_events(self, cfg) -> list[dict]:
-        events = []
-        seen_page_signatures = set()
-        offset = 0
-        page_size = 51
-        # Bound the scan to avoid runaway requests. API behavior must be validated in production.
-        for _ in range(5):
-            page = await self.albion.get_events_page(cfg.albion_guild_id, limit=page_size, offset=offset)
-            log.info("Página de kills offset=%s: %s evento(s).", offset, len(page))
-            if not page:
-                break
-            signature = tuple(str(x.get("EventId")) for x in page if isinstance(x, dict))
-            if not signature or signature in seen_page_signatures:
-                log.warning("Paginação repetida/vazia para DiscordGuildId=%s; interrompendo varredura.", cfg.discord_guild_id)
-                break
-            seen_page_signatures.add(signature)
-            events.extend(page)
-            if len(page) < page_size:
-                break
-            offset += len(page)
-        return events
-
-    async def _guild_members(self, cfg) -> list[dict]:
-        cached = self._members.get(cfg.discord_guild_id)
-        cached_members = cached[2] if cached and cached[0] == cfg.albion_guild_id else None
-        if cached_members is not None and time.monotonic() - cached[1] < self.member_sync_seconds:
-            return cached_members
-        try:
-            members = await self.albion.get_guild_members(cfg.albion_guild_id)
-        except AlbionAPIError:
-            log.warning("Falha ao atualizar membros de %s; usando a lista anterior (%s membro(s)).", cfg.albion_guild_name, len(cached_members or []))
-            return cached_members or []
-        members = [m for m in members if isinstance(m, dict) and m.get("Id")]
-        self._members[cfg.discord_guild_id] = (cfg.albion_guild_id, time.monotonic(), members)
-        log.info("Lista de membros de %s atualizada: %s membro(s).", cfg.albion_guild_name, len(members))
-        return members
-
-    async def _fetch_death_events(self, cfg) -> list[dict]:
-        members = await self._guild_members(cfg)
-        if not members:
-            log.info("Nenhum membro conhecido em %s; mortes não consultadas neste ciclo.", cfg.albion_guild_name)
-            return []
-        batch_size = min(len(members), MAX_DEATH_LOOKUPS_PER_CYCLE)
-        start = self._member_cursor.get(cfg.discord_guild_id, 0) % len(members)
-        batch = [members[(start + i) % len(members)] for i in range(batch_size)]
-        self._member_cursor[cfg.discord_guild_id] = start + batch_size
-        results = await asyncio.gather(*(self.albion.get_player_deaths(m["Id"]) for m in batch), return_exceptions=True)
-        events = []
-        failures = 0
-        for member, result in zip(batch, results):
-            if isinstance(result, BaseException):
-                failures += 1
-                log.warning("Falha ao consultar mortes de %s (%s): %s", member.get("Name"), member["Id"], type(result).__name__)
-                continue
-            events.extend(result)
-        log.info(
-            "Mortes consultadas para %s de %s membro(s) (%s falha(s)): %s evento(s).",
-            len(batch), len(members), failures, len(events),
-        )
-        return events
-
-    async def _poll_guild(self, cfg):
-        # Endpoint é consultado somente depois de uma configuração válida e ativada.
-        activation = cfg.activated_at
-        if not activation or not cfg.albion_guild_id:
+    def _remember(self, event_id: int) -> None:
+        if event_id in self._seen_ids:
             return
-        log.info(
-            "Consultando eventos: DiscordGuildId=%s AlbionGuild=%s (%s) ativado_em=%s",
-            cfg.discord_guild_id, cfg.albion_guild_name, cfg.albion_guild_id, activation.isoformat(),
-        )
-        kills_on = bool(cfg.kills_enabled and cfg.kills_channel_id)
-        deaths_on = bool(cfg.deaths_enabled and cfg.deaths_channel_id)
-        kill_events = await self._fetch_kill_events(cfg) if kills_on else []
-        death_events = await self._fetch_death_events(cfg) if deaths_on else []
+        self._seen_ids.add(event_id)
+        self._seen_order.append(event_id)
+        if len(self._seen_order) > SEEN_EVENTS_LIMIT:
+            forgotten = self._seen_order.popleft()
+            self._seen_ids.discard(forgotten)
+            self._feed_floor = max(self._feed_floor, forgotten)
 
-        candidates = {}
-        newest_event_time = None
-        invalid_timestamps = []
-        latest_kill = None
-        latest_death = None
-        for item in kill_events + death_events:
-            if not isinstance(item, dict) or item.get("EventId") is None:
-                continue
-            event_time = parse_timestamp(item.get("TimeStamp"))
-            if event_time is None:
-                invalid_timestamps.append(item.get("TimeStamp"))
-                continue
-            if newest_event_time is None or event_time > newest_event_time:
-                newest_event_time = event_time
-            if _guild_id(item.get("Killer")) == cfg.albion_guild_id and (latest_kill is None or event_time > latest_kill[0]):
-                latest_kill = (event_time, item)
-            if _guild_id(item.get("Victim")) == cfg.albion_guild_id and (latest_death is None or event_time > latest_death[0]):
-                latest_death = (event_time, item)
-            if event_time >= activation:
-                candidates[int(item["EventId"])] = item
-        if invalid_timestamps:
-            log.warning("%s evento(s) com TimeStamp inválido descartado(s). Exemplo: %r", len(invalid_timestamps), invalid_timestamps[0])
-        if newest_event_time:
-            lag_minutes = (datetime.now(timezone.utc) - newest_event_time).total_seconds() / 60
-            newest_text = f"{newest_event_time.isoformat()} (há {lag_minutes:.0f} min)"
+    async def _scan_feed(self) -> list[dict]:
+        """Lê o feed global do topo até a página que se sobrepõe à leitura anterior e devolve apenas os eventos novos."""
+        first_scan = not self._feed_ready
+        new_events: dict[int, dict] = {}
+        offset = 0
+        pages = 0
+        reached_seen = False
+        failed = False
+        while offset <= FEED_MAX_OFFSET:
+            try:
+                page = await self.albion.get_recent_events(limit=FEED_PAGE_SIZE, offset=offset)
+            except AlbionAPIError:
+                log.warning("Falha ao ler o feed global (offset=%s); seguindo com %s evento(s) novo(s) lidos até aqui.", offset, len(new_events))
+                failed = True
+                break
+            pages += 1
+            overlaps = False
+            for item in page:
+                if not isinstance(item, dict) or item.get("EventId") is None:
+                    continue
+                event_id = int(item["EventId"])
+                if event_id < self._feed_floor or (event_id in self._seen_ids and event_id not in self._unconfirmed_ids):
+                    overlaps = True
+                    continue
+                if event_id not in self._seen_ids:
+                    new_events.setdefault(event_id, item)
+            if first_scan or overlaps or len(page) < FEED_PAGE_SIZE:
+                reached_seen = True
+                break
+            offset += FEED_PAGE_SIZE
+        if not reached_seen and not failed:
+            log.warning("Feed global: %s eventos lidos sem encontrar eventos já vistos; os mais antigos podem ter sido perdidos.", offset)
+        for event_id in new_events:
+            self._remember(event_id)
+        if failed:
+            self._unconfirmed_ids.update(new_events)
+        else:
+            self._unconfirmed_ids.clear()
+        if first_scan:
+            if pages:
+                self._feed_ready = True
+                self._feed_floor = min(new_events, default=0)
+                log.info("Feed global: leitura inicial marcou %s evento(s) como vistos; a partir de agora só entram eventos novos.", len(new_events))
+            return []
+        times = [t for t in (parse_timestamp(e.get("TimeStamp")) for e in new_events.values()) if t]
+        if times:
+            newest = max(times)
+            lag_minutes = (datetime.now(timezone.utc) - newest).total_seconds() / 60
+            newest_text = f"{newest.isoformat()} (há {lag_minutes:.0f} min)"
         else:
             newest_text = "nenhum"
-        log.info(
-            "Eventos recebidos: kills=%s mortes=%s; após a ativação: %s; evento mais recente: %s.",
-            len(kill_events), len(death_events), len(candidates), newest_text,
-        )
+        log.info("Feed global: %s página(s), %s evento(s) novo(s); mais recente: %s.", pages, len(new_events), newest_text)
+        return list(new_events.values())
 
-        initial_key = (cfg.discord_guild_id, activation)
-        initial_ids = []
-        if initial_key not in self._initial_published:
-            # Na ativação, publica a última kill e a última morte já existentes para o canal não começar vazio.
-            for kind, latest, enabled in (("kill", latest_kill, kills_on), ("death", latest_death, deaths_on)):
-                if not enabled:
-                    continue
-                if latest is None:
-                    log.info("Nenhum evento de %s anterior à ativação encontrado para publicar.", kind)
-                    continue
-                event_id = int(latest[1]["EventId"])
-                initial_ids.append(event_id)
-                candidates.setdefault(event_id, latest[1])
-                log.info("Último evento de %s já existente: %s (%s); será publicado se ainda não foi.", kind, event_id, latest[0].isoformat())
+    def _involves_guild(self, event: dict, guild_id: str) -> bool:
+        return _guild_id(event.get("Killer")) == guild_id or _guild_id(event.get("Victim")) == guild_id
+
+    async def _poll_guild(self, cfg, feed_events: list[dict]):
+        if not cfg.activated_at or not cfg.albion_guild_id:
+            return
+        candidates = {
+            int(event["EventId"]): event
+            for event in feed_events
+            if isinstance(event, dict) and event.get("EventId") is not None and self._involves_guild(event, cfg.albion_guild_id)
+        }
+        log.info(
+            "DiscordGuildId=%s AlbionGuild=%s (%s): %s evento(s) novo(s) da guilda no feed.",
+            cfg.discord_guild_id, cfg.albion_guild_name, cfg.albion_guild_id, len(candidates),
+        )
 
         for event_id, event in sorted(candidates.items(), key=lambda pair: parse_timestamp(pair[1].get("TimeStamp")) or datetime.min.replace(tzinfo=timezone.utc)):
             await self._publish_event(cfg, event_id, event)
-
-        if initial_key not in self._initial_published:
-            stored_initial = [await self.repos.get_event(cfg.discord_guild_id, event_id) for event_id in initial_ids]
-            if all(record and record.status == "PUBLISHED" for record in stored_initial):
-                self._initial_published.add(initial_key)
-            else:
-                log.warning("Últimos eventos da ativação ainda não publicados para DiscordGuildId=%s; nova tentativa no próximo ciclo.", cfg.discord_guild_id)
 
     async def _publish_event(self, cfg, event_id: int, event: dict):
         killer = event.get("Killer") or {}
