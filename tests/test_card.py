@@ -4,7 +4,8 @@ import pytest
 from PIL import Image
 from app.integrations.albion.prices import AlbionPriceClient
 from app.integrations.albion.regions import prices_url_for
-from app.modules.combat_tracker.card import _inventory_layout, draw_card, event_items, format_short, item_key, victim_items
+from app.modules.combat_tracker.card import KillCardRenderer, _inventory_layout, draw_card, format_short, item_key
+from app.modules.combat_tracker.events import event_items, victim_items
 
 def _png(color) -> bytes:
     output = io.BytesIO()
@@ -58,6 +59,35 @@ def test_inventory_shrinks_to_fit_two_rows_when_possible():
 def test_prices_url_for_known_and_unknown_hosts():
     assert prices_url_for("https://gameinfo-ams.albiononline.com/api/gameinfo") == "https://europe.albion-online-data.com"
     assert prices_url_for("https://example.com") == "https://west.albion-online-data.com"
+
+@pytest.mark.asyncio
+async def test_slow_card_falls_back_to_text(monkeypatch):
+    import asyncio
+    from app.modules.combat_tracker import messages
+
+    class SlowRenderer:
+        async def render(self, event, kind, silver):
+            await asyncio.sleep(1)
+            return b""
+
+    monkeypatch.setattr(messages, "CARD_TIMEOUT_SECONDS", 0.05)
+    embed, file = await messages.build_message(SlowRenderer(), EVENT, "kill", None)
+    assert file is None and embed.title == messages.TITLES["kill"] and embed.fields
+
+@pytest.mark.asyncio
+async def test_missing_icon_is_remembered():
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(404)
+
+    renderer = KillCardRenderer()
+    renderer._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    assert await renderer._icon("T4_TRASH", 0) is None
+    assert await renderer._icon("T4_TRASH", 0) is None
+    assert len(calls) == 1
+    await renderer.close()
 
 @pytest.mark.asyncio
 async def test_price_estimate_uses_quality_then_any_quality():

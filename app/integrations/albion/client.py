@@ -54,6 +54,18 @@ class AlbionClient:
             raise AlbionAPIError("Formato inesperado na pesquisa.")
         return result
 
+    async def get_player(self, player_id: str) -> dict[str, Any]:
+        result = await self._get(f"players/{player_id}")
+        if not isinstance(result, dict) or not result.get("Id"):
+            raise AlbionAPIError("Formato inesperado ao consultar o personagem.")
+        return result
+
+    async def get_guild_members(self, guild_id: str) -> list[dict[str, Any]]:
+        result = await self._get(f"guilds/{guild_id}/members")
+        if not isinstance(result, list):
+            raise AlbionAPIError("Formato inesperado na lista de membros da guilda.")
+        return result
+
     async def get_recent_events(self, limit: int = 51, offset: int = 0) -> list[dict[str, Any]]:
         result = await self._get("events", {"limit": limit, "offset": offset})
         if not isinstance(result, list):

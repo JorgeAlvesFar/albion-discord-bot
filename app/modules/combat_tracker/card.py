@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 import httpx
 from PIL import Image, ImageDraw, ImageFont
+from app.modules.combat_tracker.events import event_items, inventory_items
 
 log = logging.getLogger(__name__)
 
@@ -39,17 +40,6 @@ def format_short(value: float) -> str:
 
 def item_key(item: dict[str, Any]) -> ItemKey:
     return item["Type"], int(item.get("Quality") or 0)
-
-def _items(values) -> list[dict[str, Any]]:
-    return [item for item in values or [] if isinstance(item, dict) and item.get("Type")]
-
-def victim_items(event: dict[str, Any]) -> list[dict[str, Any]]:
-    victim = event.get("Victim") or {}
-    return _items((victim.get("Equipment") or {}).values()) + _items(victim.get("Inventory"))
-
-def event_items(event: dict[str, Any]) -> list[dict[str, Any]]:
-    killer = event.get("Killer") or {}
-    return _items((killer.get("Equipment") or {}).values()) + victim_items(event)
 
 # A fonte embutida no Pillow (Aileron) não tem acentos: os textos do card evitam letras acentuadas.
 @lru_cache(maxsize=None)
@@ -137,7 +127,7 @@ def draw_card(
     killer = event.get("Killer") or {}
     victim = event.get("Victim") or {}
     sides = [killer.get("Equipment") or {}, victim.get("Equipment") or {}]
-    inventory = _items(victim.get("Inventory"))
+    inventory = inventory_items(event)
     images = {key: _open(data) for key, data in icons.items()}
 
     grid_w, grid_h = 3 * SLOT + 2 * GAP, 4 * SLOT + 3 * GAP
@@ -219,7 +209,8 @@ class KillCardRenderer:
         self.cache_size = cache_size
         self._client = httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "AlbionDiscordBot/0.1"})
         self._semaphore = asyncio.Semaphore(max_concurrency)
-        self._icons: dict[tuple[str, int, int], bytes] = {}
+        # None registra item sem ícone no render (HTTP 404), para não consultar de novo a cada card.
+        self._icons: dict[tuple[str, int, int], bytes | None] = {}
         try:
             self._fame_icon = Image.open(FAME_ICON_PATH).convert("RGBA")
         except OSError:
@@ -240,13 +231,21 @@ class KillCardRenderer:
             async with self._semaphore:
                 response = await self._client.get(ICON_URL.format(item_type), params=params)
             response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                log.warning("Ícone indisponível para %s (qualidade %s): HTTP %s", item_type, quality, exc.response.status_code)
+                return None
+            log.debug("Item %s não tem ícone no render (HTTP 404).", item_type)
+            content = None
         except httpx.HTTPError as exc:
             log.warning("Ícone indisponível para %s (qualidade %s): %s", item_type, quality, type(exc).__name__)
             return None
+        else:
+            content = response.content
         if len(self._icons) >= self.cache_size:
             self._icons.clear()
-        self._icons[key] = response.content
-        return response.content
+        self._icons[key] = content
+        return content
 
     async def render(self, event: dict[str, Any], kind: str, silver: float | None) -> bytes:
         keys = sorted({item_key(item) for item in event_items(event)})

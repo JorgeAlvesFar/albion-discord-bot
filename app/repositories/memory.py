@@ -1,41 +1,16 @@
-import asyncio
-from app.repositories.models import ServerConfig, CombatEventRecord
+from app.repositories.config_store import ConfigStore
+from app.repositories.event_store import COMPLETED_KEYS_LIMIT, EventStore
+from app.repositories.link_store import LinkConflict, LinkStore
 
-class MemoryRepositories:
-    def __init__(self):
-        self._configs: dict[int, ServerConfig] = {}
-        self._events: dict[tuple[int, int], CombatEventRecord] = {}
-        self._lock = asyncio.Lock()
+__all__ = ["MemoryRepositories", "LinkConflict"]
 
-    async def get_config(self, discord_guild_id: int) -> ServerConfig | None:
-        async with self._lock:
-            return self._configs.get(discord_guild_id)
+class MemoryRepositories(ConfigStore, LinkStore, EventStore):
+    """Armazenamento em memória da aplicação: configurações, vínculos e fila de eventos.
 
-    async def save_config(self, config: ServerConfig) -> None:
-        async with self._lock:
-            self._configs[config.discord_guild_id] = config
+    Cada parte tem sua própria trava; tudo se perde quando o processo reinicia.
+    """
 
-    async def all_configs(self) -> list[ServerConfig]:
-        async with self._lock:
-            return list(self._configs.values())
-
-    async def add_if_new(self, record: CombatEventRecord) -> bool:
-        key = (record.discord_guild_id, record.event_id)
-        async with self._lock:
-            if key in self._events:
-                return False
-            self._events[key] = record
-            return True
-
-    async def update_event(self, discord_guild_id: int, event_id: int, status: str, message_id: int | None = None, kind: str | None = None) -> None:
-        async with self._lock:
-            record = self._events.get((discord_guild_id, event_id))
-            if not record:
-                return
-            record.status = status
-            if message_id is not None and kind is not None:
-                record.message_ids[kind] = message_id
-
-    async def get_event(self, discord_guild_id: int, event_id: int) -> CombatEventRecord | None:
-        async with self._lock:
-            return self._events.get((discord_guild_id, event_id))
+    def __init__(self, completed_limit: int = COMPLETED_KEYS_LIMIT):
+        ConfigStore.__init__(self)
+        LinkStore.__init__(self)
+        EventStore.__init__(self, completed_limit)

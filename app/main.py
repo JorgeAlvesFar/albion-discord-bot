@@ -9,7 +9,10 @@ from app.repositories.memory import MemoryRepositories
 from app.integrations.albion.client import AlbionClient
 from app.integrations.albion.prices import AlbionPriceClient
 from app.integrations.albion.regions import prices_url_for
-from app.modules.configuration.cog import ConfigurationCog
+from app.modules.guild_registration.cog import GuildRegistrationCog
+from app.modules.members_config.cog import MembersConfigCog
+from app.modules.member_registration.cog import MemberRegistrationCog
+from app.modules.member_registration.service import MemberSync
 from app.modules.combat_tracker.card import KillCardRenderer
 from app.modules.combat_tracker.service import CombatTracker
 from app.modules.combat_tracker.cog import CombatCog
@@ -36,16 +39,21 @@ class AlbionBot(commands.Bot):
             self, self.albion, self.repos, settings.combat_poll_seconds,
             renderer=self.card_renderer, prices=self.prices,
         )
-        await self.add_cog(ConfigurationCog(self, self.albion, self.repos, self.tracker))
-        await self.add_cog(CombatCog(self, self.repos))
-        await self.tree.sync()
+        await self.add_cog(GuildRegistrationCog(self, self.albion, self.repos, self.tracker))
+        self.member_sync = MemberSync(self, self.albion, self.repos, settings.member_sync_seconds)
+        await self.add_cog(MembersConfigCog(self, self.repos))
+        await self.add_cog(MemberRegistrationCog(self, self.albion, self.repos))
+        await self.add_cog(CombatCog(self, self.repos, self.tracker))
+        # Sincronização global: substitui o conjunto de comandos (um comando removido some do Discord em alguns minutos).
+        synced = await self.tree.sync()
         self.tracker.start()
-        log.info("Comandos de aplicação sincronizados.")
+        self.member_sync.start()
+        log.info("Comandos de aplicação sincronizados: %s.", ", ".join(f"/{command.name}" for command in synced))
 
     async def close(self):
-        tracker = getattr(self, "tracker", None)
-        if tracker:
-            await tracker.close()
+        for task_owner in (getattr(self, "tracker", None), getattr(self, "member_sync", None)):
+            if task_owner:
+                await task_owner.close()
         for client in (getattr(self, "albion", None), getattr(self, "card_renderer", None), getattr(self, "prices", None)):
             if client:
                 await client.close()

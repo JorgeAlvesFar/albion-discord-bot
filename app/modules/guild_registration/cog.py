@@ -1,0 +1,184 @@
+import logging
+import discord
+from discord import app_commands
+from discord.ext import commands
+from app.integrations.albion.client import AlbionAPIError
+from app.modules.common import AdminView, publish_summary, reply, require_admin, summary_embed
+from app.modules.guild_registration.service import MAX_OPTIONS, guild_options, link_guild, reset_guild
+from app.repositories.models import GuildLink
+
+log = logging.getLogger(__name__)
+
+MODULE = "Cadastro da guilda"
+
+def _alliance(name: str | None) -> str:
+    return name or "Sem aliança informada"
+
+def _add_guild_fields(embed: discord.Embed, guild: GuildLink) -> None:
+    embed.add_field(name="Guilda", value=guild.name, inline=True)
+    embed.add_field(name="Aliança", value=_alliance(guild.alliance_name), inline=True)
+    embed.add_field(name="Guild ID", value=f"`{guild.guild_id}`", inline=False)
+
+def _status_embed(cfg) -> discord.Embed:
+    embed = discord.Embed(title="Cadastro da guilda do Albion", color=discord.Color.blurple())
+    if cfg and cfg.guild:
+        _add_guild_fields(embed, cfg.guild)
+        embed.add_field(name="Killboard", value="Ativo" if cfg.killboard_active else "Desativado", inline=True)
+        embed.set_footer(text="Pesquise para trocar a guilda. Trocar ou redefinir desativa e apaga a configuração do killboard.")
+    else:
+        embed.description = "Nenhuma guilda cadastrada neste servidor. Pesquise pelo nome da guilda para cadastrar."
+    return embed
+
+def _result_summary(interaction: discord.Interaction, operation: str, cfg, result) -> discord.Embed:
+    embed = summary_embed(MODULE, operation, interaction.user)
+    if cfg.guild:
+        _add_guild_fields(embed, cfg.guild)
+    if result.previous and (cfg.guild is None or result.previous.guild_id != cfg.guild.guild_id):
+        embed.add_field(name="Guilda anterior", value=f"{result.previous.name} (`{result.previous.guild_id}`)", inline=False)
+    killboard = "Desativado"
+    if result.previous:
+        killboard += " e redefinido" + (" (estava ativo)" if result.killboard_was_active else "")
+    embed.add_field(name="Killboard", value=killboard, inline=False)
+    missing = [] if cfg.guild else ["guilda do Albion (use /cadastrar)"]
+    if not cfg.killboard_active:
+        missing.append("killboard (use /killboard)")
+    embed.add_field(name="Sem configuração", value="\n".join(missing) or "Nada", inline=False)
+    return embed
+
+class GuildPanelView(AdminView):
+    def __init__(self, cog, discord_guild_id: int, has_guild: bool):
+        super().__init__(discord_guild_id)
+        self.cog = cog
+        self.reset.disabled = not has_guild
+
+    @discord.ui.button(label="Redefinir", style=discord.ButtonStyle.danger, row=0)
+    async def reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cfg = await self.cog.repos.get_config(self.discord_guild_id)
+        if not cfg or not cfg.guild:
+            await interaction.response.edit_message(content="Não há guilda cadastrada para redefinir.", embed=None, view=None)
+            return
+        view = ConfirmResetView(self.cog, self.discord_guild_id)
+        view.origin = interaction
+        self.finish()
+        await interaction.response.edit_message(
+            content=(
+                f"**Redefinir o cadastro da guilda?**\n"
+                f"Será removida a associação com **{cfg.guild.name}** (`{cfg.guild.guild_id}`).\n"
+                f"O killboard depende da guilda: ele será **desativado e sua configuração apagada**."
+            ),
+            embed=None, view=view,
+        )
+
+    @discord.ui.button(label="Pesquisar guilda", style=discord.ButtonStyle.primary, row=0)
+    async def search(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(GuildSearchModal(self.cog, self.discord_guild_id))
+
+class GuildSearchModal(discord.ui.Modal, title="Pesquisar guilda do Albion"):
+    name = discord.ui.TextInput(label="Nome da guilda", placeholder="Digite o nome para pesquisar", min_length=2, max_length=100)
+
+    def __init__(self, cog, discord_guild_id: int):
+        super().__init__()
+        self.cog, self.discord_guild_id = cog, discord_guild_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_admin(interaction):
+            return
+        # O Discord invalida a interação sem resposta em 3 s; a API do Albion pode demorar mais.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        term = str(self.name).strip()
+        try:
+            options = guild_options(await self.cog.albion.search(term))
+        except AlbionAPIError:
+            await reply(interaction, "A API do Albion não respondeu. Nada foi alterado; tente novamente em instantes.")
+            return
+        if not options:
+            await reply(interaction, f"Nenhuma guilda encontrada para **{term}**. Confira o nome e tente novamente.")
+            return
+        note = f"\nMostrando {MAX_OPTIONS} de {len(options)} resultados; refine o nome se a guilda não aparecer." if len(options) > MAX_OPTIONS else ""
+        view = GuildResultsView(self.cog, self.discord_guild_id, options[:MAX_OPTIONS])
+        view.origin = interaction
+        await reply(interaction, f"Selecione a guilda correta. Confira o nome, a aliança e o ID.{note}", view=view)
+
+class GuildResultsView(AdminView):
+    def __init__(self, cog, discord_guild_id: int, options: list[GuildLink]):
+        super().__init__(discord_guild_id)
+        self.cog, self.options = cog, options
+        self.choose.options = [
+            discord.SelectOption(label=o.name[:100], description=f"ID: {o.guild_id} | {_alliance(o.alliance_name)}"[:100], value=str(i))
+            for i, o in enumerate(options)
+        ]
+
+    @discord.ui.select(placeholder="Escolha a guilda", min_values=1, max_values=1, options=[discord.SelectOption(label="-", value="-")])
+    async def choose(self, interaction: discord.Interaction, select: discord.ui.Select):
+        option = self.options[int(select.values[0])]
+        cfg = await self.cog.repos.get_config(self.discord_guild_id)
+        warning = ""
+        if cfg and cfg.guild and cfg.guild.guild_id != option.guild_id:
+            warning = (
+                f"\n\n⚠️ A guilda atual **{cfg.guild.name}** (`{cfg.guild.guild_id}`) será substituída. "
+                "O killboard será **desativado e sua configuração apagada**; os vínculos de personagens não são transferidos."
+            )
+        view = ConfirmGuildView(self.cog, self.discord_guild_id, option)
+        view.origin = interaction
+        self.finish()
+        await interaction.response.edit_message(
+            content=f"Confirme a guilda **{option.name}**\nAliança: **{_alliance(option.alliance_name)}**\nGuild ID: `{option.guild_id}`{warning}",
+            view=view,
+        )
+
+class ConfirmGuildView(AdminView):
+    def __init__(self, cog, discord_guild_id: int, option: GuildLink):
+        super().__init__(discord_guild_id)
+        self.cog, self.option = cog, option
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.finish()
+        await interaction.response.edit_message(content="Cadastro cancelado. Nada foi alterado.", view=None)
+
+    @discord.ui.button(label="Confirmar guilda", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.finish()
+        result = await link_guild(self.cog.repos, self.cog.tracker, self.discord_guild_id, self.option)
+        cfg = await self.cog.repos.get_config(self.discord_guild_id)
+        if not result.changed:
+            await interaction.response.edit_message(content=f"**{self.option.name}** já era a guilda cadastrada. Nada mudou.", view=None)
+            return
+        await interaction.response.edit_message(content=f"Guilda **{cfg.guild.name}** cadastrada. O resumo foi publicado neste canal.", view=None)
+        await publish_summary(interaction, _result_summary(interaction, "guilda alterada" if result.previous else "guilda cadastrada", cfg, result))
+
+class ConfirmResetView(AdminView):
+    def __init__(self, cog, discord_guild_id: int):
+        super().__init__(discord_guild_id)
+        self.cog = cog
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.finish()
+        await interaction.response.edit_message(content="Redefinição cancelada. Nada foi alterado.", view=None)
+
+    @discord.ui.button(label="Confirmar redefinição", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.finish()
+        result = await reset_guild(self.cog.repos, self.cog.tracker, self.discord_guild_id)
+        if result is None:
+            await interaction.response.edit_message(content="Não há guilda cadastrada para redefinir.", view=None)
+            return
+        cfg = await self.cog.repos.get_config(self.discord_guild_id)
+        await interaction.response.edit_message(content="Cadastro da guilda redefinido. O resumo foi publicado neste canal.", view=None)
+        await publish_summary(interaction, _result_summary(interaction, "cadastro redefinido", cfg, result))
+
+class GuildRegistrationCog(commands.Cog):
+    def __init__(self, bot, albion, repos, tracker):
+        self.bot, self.albion, self.repos, self.tracker = bot, albion, repos, tracker
+
+    @app_commands.command(name="cadastrar", description="Associa este servidor a uma guilda do Albion Online")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def cadastrar(self, interaction: discord.Interaction):
+        if not await require_admin(interaction):
+            return
+        cfg = await self.repos.get_config(interaction.guild.id)
+        view = GuildPanelView(self, interaction.guild.id, bool(cfg and cfg.guild))
+        view.origin = interaction
+        await interaction.response.send_message(embed=_status_embed(cfg), view=view, ephemeral=True)
