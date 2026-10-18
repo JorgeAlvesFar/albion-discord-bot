@@ -6,7 +6,7 @@ O bot tem quatro comandos:
 
 | Comando | Quem usa | Para quê |
 | --- | --- | --- |
-| `/cadastrar` | Administradores | Dizer ao bot qual é a guilda do Albion deste servidor. |
+| `/cadastrar` | Administradores | Dizer ao bot qual é a guilda do Albion deste servidor e onde publicar a verificação de membros. |
 | `/registrar-membros` | Administradores | Escolher o cargo e a tag que os membros registrados recebem. |
 | `/registrar` | Todos os membros | Vincular o seu personagem do Albion à sua conta do Discord. |
 | `/killboard` | Administradores | Publicar no Discord as kills e as mortes da guilda. |
@@ -14,7 +14,7 @@ O bot tem quatro comandos:
 ## Por onde começar
 
 **Administradores**, nesta ordem:
-1. `/cadastrar`: escolha a guilda. Sem isso, os outros comandos não funcionam.
+1. `/cadastrar`: escolha a guilda e, se quiser, o canal e o horário da verificação de membros. Sem a guilda, os outros comandos não funcionam.
 2. `/registrar-membros`: opcional. Escolha um cargo e/ou uma tag para os membros.
 3. `/killboard`: opcional. Escolha os canais e ligue as notificações.
 4. Avise os membros para usarem `/registrar`.
@@ -31,19 +31,26 @@ O bot tem quatro comandos:
 
 ## `/cadastrar`: escolher a guilda (administradores)
 
-Liga este servidor do Discord a uma guilda do Albion Online. Tudo o mais depende disso.
+Liga este servidor do Discord a uma guilda do Albion Online. Tudo o mais depende disso. No mesmo painel você escolhe **onde** o bot avisa quando alguém sai da guilda e **a que horas** sai o relatório diário.
 
 **Como usar:**
-1. Digite `/cadastrar`. Aparece a guilda atual (se já houver uma).
+1. Digite `/cadastrar`. Aparece a guilda atual (se já houver uma), o canal da verificação e o horário do relatório.
 2. Clique em **Pesquisar guilda** e digite o nome da guilda.
 3. Escolha a guilda certa na lista. Confira o **Guild ID**: guildas com nomes parecidos são diferentes (por exemplo, "TELETOM" e "T E L E T O M").
 4. Clique em **Confirmar guilda**.
+5. Escolha o **canal da verificação de membros** (canal de texto) e o **horário do relatório diário** (fuso de Brasília). Clique em **Salvar verificação**.
+
+**O que o bot publica nesse canal:**
+- **Na hora:** uma mensagem cada vez que a verificação remove o cargo de alguém que não está mais na guilda. O registro dessa pessoa é desativado; para voltar, ela usa `/registrar` de novo.
+- **Uma vez ao dia**, no horário escolhido: um relatório com o que foi verificado desde a última postagem (quantos registros foram checados, quem foi removido e se a API falhou em alguma consulta).
+
+Se você não escolher um canal, a verificação continua acontecendo (quem sai perde o cargo), mas **nada é publicado**.
 
 **Bom saber:**
 - O bot nunca escolhe a guilda sozinho; você sempre confirma.
-- **Trocar a guilda desliga o killboard** e apaga os canais escolhidos nele. Configure o `/killboard` de novo depois.
+- **Trocar a guilda desliga o killboard** e apaga os canais escolhidos nele. O canal e o horário da verificação de membros **permanecem**. Configure o `/killboard` de novo depois.
 - Ao trocar a guilda, os membros precisam usar `/registrar` de novo com personagens da nova guilda.
-- **Redefinir** remove a guilda (e, junto, o killboard). O bot pede confirmação antes.
+- **Redefinir** remove a guilda (e, junto, o killboard) e também apaga o canal e o horário da verificação. O bot pede confirmação antes.
 
 ---
 
@@ -91,7 +98,8 @@ Se o servidor tiver cargo e tag configurados, você recebe o cargo e o seu apeli
 
 **Bom saber:**
 - Cada pessoa tem **um** personagem registrado por servidor. Para trocar de personagem, use `/registrar` de novo: o bot pergunta se você quer substituir.
-- Se o seu personagem **sair da guilda**, você perde o cargo do servidor (mas o registro e o apelido ficam). Se **voltar**, recebe o cargo de novo. O bot confere isso de tempos em tempos.
+- O bot confere de tempos em tempos (a cada 15 minutos, por padrão) se o seu personagem ainda está na guilda. Se não estiver mais, por qualquer motivo (saiu, foi expulso, mudou de guilda, apagou o personagem), você **perde o cargo** do servidor. O apelido não muda. Se os administradores tiverem configurado um canal em `/cadastrar`, o bot avisa lá na hora.
+- Depois disso o seu registro fica **desativado**. Se você voltar para a guilda, **use `/registrar` de novo** para receber o cargo outra vez; o bot não devolve sozinho.
 
 ---
 

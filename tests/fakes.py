@@ -60,10 +60,14 @@ class FakeChannel(discord.TextChannel):
         self.block = block
         self.perms = SimpleNamespace(**{"view_channel": True, "send_messages": True, "embed_links": True, "attach_files": True, **perms})
 
+    @property
+    def mention(self):
+        return f"<#{self.id}>"
+
     def permissions_for(self, member):
         return self.perms
 
-    async def send(self, embed=None, file=None):
+    async def send(self, content=None, embed=None, file=None, **kwargs):
         if self.block is not None:
             await self.block.wait()
         if self.failures:

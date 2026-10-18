@@ -8,6 +8,9 @@ log = logging.getLogger(__name__)
 class AlbionAPIError(RuntimeError):
     pass
 
+class AlbionNotFoundError(AlbionAPIError):
+    """A API respondeu 404: o recurso (ex.: personagem apagado) não existe. Não é indisponibilidade."""
+
 class AlbionClient:
     """Cliente de produção: sempre consulta a API real do Albion."""
     def __init__(self, base_url: str, timeout: float = 15, max_concurrency: int = 4, retry_attempts: int = 3):
@@ -42,6 +45,8 @@ class AlbionClient:
                             try: retry_after = float(exc.response.headers.get("Retry-After", "0"))
                             except ValueError: retry_after = 0
                         await asyncio.sleep(max(retry_after, min(2 ** attempt, 8)))
+        if isinstance(last_error, httpx.HTTPStatusError) and last_error.response.status_code == 404:
+            raise AlbionNotFoundError(f"Não encontrado na API do Albion ({path}).") from last_error
         log.warning("Falha na API Albion em %s: %s", path, type(last_error).__name__ if last_error else "resposta inválida")
         raise AlbionAPIError(f"Falha ao consultar API do Albion ({path}).") from last_error
 

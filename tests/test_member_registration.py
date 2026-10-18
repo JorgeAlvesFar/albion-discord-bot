@@ -1,5 +1,5 @@
 import pytest
-from app.integrations.albion.client import AlbionAPIError
+from app.integrations.albion.client import AlbionAPIError, AlbionNotFoundError
 from app.modules.member_registration.cog import CharacterModal, MemberRegistrationCog, PlayerSelectView, ReplaceLinkView
 from app.modules.member_registration.service import (
     MemberSync, PlayerOption, RegistrationError, apply_member_settings, confirm_in_guild, player_options, save_registration,
@@ -30,6 +30,8 @@ class FakePlayersAlbion:
     async def get_player(self, player_id):
         if self.fail_player:
             raise AlbionAPIError("indisponível")
+        if player_id not in self.players:
+            raise AlbionNotFoundError("404")
         return self.players[player_id]
 
     async def get_guild_members(self, guild_id):
@@ -261,11 +263,15 @@ async def test_character_linked_to_someone_else_is_refused():
 # ---------- Saída e retorno à guilda ----------
 
 class SyncBot:
-    def __init__(self, guilds):
+    def __init__(self, guilds, channels=None):
         self.guilds = {guild.id: guild for guild in guilds}
+        self.channels = channels or {}
 
     def get_guild(self, guild_id):
         return self.guilds.get(guild_id)
+
+    def get_channel(self, channel_id):
+        return self.channels.get(channel_id)
 
 async def synced_setup():
     repos = MemoryRepositories()
@@ -279,32 +285,116 @@ async def synced_setup():
     return MemberSync(SyncBot([guild]), albion, repos), albion, repos, member
 
 @pytest.mark.asyncio
-async def test_member_who_leaves_loses_role_but_keeps_link_and_nickname_then_regains_it():
+async def test_member_who_leaves_loses_role_and_is_ignored_until_registering_again():
     sync, albion, repos, member = await synced_setup()
     albion.roster[GUILD] = ["outro"]
     albion.players["p1"]["GuildId"] = "OTHER"
     stats = await sync.run_once()
     link = await repos.get_link(1, 500)
-    assert stats.left == 1 and ROLE not in member.roles and member.nick == "[TLT] LeonamUchiha"
-    assert link is not None and link.in_guild is False
+    assert stats.left == 1 and stats.roles_removed == 1 and ROLE not in member.roles and member.nick == "[TLT] LeonamUchiha"
+    assert not link.active and link.deactivation_reason and link.deactivated_at
+    # Voltou para a guilda: o bot não devolve o cargo nem volta a verificá-lo.
     albion.roster[GUILD] = ["p1"]
+    albion.players["p1"]["GuildId"] = GUILD
     stats = await sync.run_once()
-    assert stats.returned == 1 and ROLE in member.roles and link.in_guild
+    assert stats.checked == 0 and ROLE not in member.roles
+    # Só um novo /registrar volta a valer, sem pedir para substituir o vínculo antigo.
+    cog = MemberRegistrationCog(None, albion, repos)
+    modal = CharacterModal(cog)
+    modal.name._value = "LeonamUchiha"
+    interaction = FakeInteraction(guild=member.guild, user=member)
+    await modal.on_submit(interaction)
+    assert "registrado como" in interaction.private_texts()[0] and ROLE in member.roles
+    assert (await repos.get_link(1, 500)).active and (await sync.run_once()).checked == 1
+
+@pytest.mark.asyncio
+async def test_inactive_link_does_not_block_another_user():
+    sync, albion, repos, member = await synced_setup()
+    albion.roster[GUILD] = ["outro"]
+    albion.players["p1"]["GuildId"] = "OTHER"
+    await sync.run_once()
+    albion.players["p1"]["GuildId"] = GUILD
+    await save_registration(repos, await repos.get_config(1), 777, leonam())
+    assert (await repos.get_link(1, 777)).active
+
+@pytest.mark.asyncio
+async def test_failed_removal_keeps_link_active_to_retry():
+    sync, albion, repos, member = await synced_setup()
+    member.guild.me = bot_member(top_position=2)  # cargo do bot abaixo do cargo configurado
+    albion.roster[GUILD] = ["outro"]
+    albion.players["p1"]["GuildId"] = "OTHER"
+    stats = await sync.run_once()
+    assert stats.role_errors == 1 and stats.left == 0 and (await repos.get_link(1, 500)).active and ROLE in member.roles
+    member.guild.me = bot_member()  # hierarquia corrigida: o próximo ciclo remove
+    stats = await sync.run_once()
+    assert stats.left == 1 and ROLE not in member.roles and not (await repos.get_link(1, 500)).active
 
 @pytest.mark.asyncio
 async def test_api_failures_never_remove_roles():
     sync, albion, repos, member = await synced_setup()
-    albion.fail_roster = True
-    assert (await sync.run_once()).skipped_servers == 1
-    albion.fail_roster = False
-    albion.roster[GUILD] = []  # resposta vazia suspeita
-    assert (await sync.run_once()).skipped_servers == 1
+    albion.fail_roster = albion.fail_player = True  # API inteira fora do ar
+    stats = await sync.run_once()
+    assert stats.roster_unavailable == 1 and stats.unknown == 1 and stats.roles_removed == 0
+    albion.fail_roster = albion.fail_player = False
+    albion.roster[GUILD] = []  # lista vazia suspeita: decide pelo perfil, que diz que está na guilda
+    assert (await sync.run_once()).roster_unavailable == 1
     albion.roster[GUILD] = ["outro"]
     albion.fail_player = True  # ausente da lista, mas o perfil não pôde ser confirmado
     assert (await sync.run_once()).unknown == 1
     albion.fail_player = False  # ausente da lista, mas o perfil ainda diz que está na guilda
     await sync.run_once()
-    assert ROLE in member.roles and (await repos.get_link(1, 500)).in_guild
+    assert ROLE in member.roles and (await repos.get_link(1, 500)).active
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["outra_guilda", "sem_guilda", "personagem_apagado", "lista_fora_do_ar"])
+async def test_any_reason_for_not_being_in_the_guild_removes_the_role(scenario):
+    sync, albion, repos, member = await synced_setup()
+    albion.roster[GUILD] = ["outro"]
+    if scenario == "outra_guilda":
+        albion.players["p1"].update(GuildId="OTHER", GuildName="Outra")
+    elif scenario == "sem_guilda":
+        albion.players["p1"].update(GuildId=None, GuildName="")
+    elif scenario == "personagem_apagado":
+        del albion.players["p1"]
+    else:
+        albion.fail_roster = True  # sem a lista, o perfil ainda decide
+        albion.players["p1"].update(GuildId="OTHER", GuildName="Outra")
+    stats = await sync.run_once()
+    assert stats.left == 1 and stats.roles_removed == 1 and ROLE not in member.roles
+    assert (await repos.get_link(1, 500)) is not None and member.nick == "[TLT] LeonamUchiha"
+
+@pytest.mark.asyncio
+async def test_guild_change_removes_role_from_members_of_the_old_guild():
+    sync, albion, repos, member = await synced_setup()
+    cfg = await repos.get_config(1)
+    cfg.guild = GuildLink("NOVA", "Nova guilda")  # /cadastrar trocou a guilda; vínculos não são transferidos
+    albion.roster["NOVA"] = ["outro"]
+    stats = await sync.run_once()
+    assert stats.left == 1 and ROLE not in member.roles
+
+@pytest.mark.asyncio
+async def test_role_problems_are_counted_and_nothing_else_breaks():
+    sync, albion, repos, member = await synced_setup()
+    member.guild.me = bot_member(top_position=2)  # cargo do bot ficou abaixo do cargo configurado
+    albion.roster[GUILD] = ["outro"]
+    albion.players["p1"].update(GuildId="OTHER")
+    stats = await sync.run_once()
+    assert stats.left == 0 and stats.role_errors == 1 and ROLE in member.roles
+
+@pytest.mark.asyncio
+async def test_user_who_left_the_discord_server_is_ignored():
+    sync, albion, repos, member = await synced_setup()
+    del member.guild.members[500]
+    albion.roster[GUILD] = ["outro"]
+    albion.players["p1"].update(GuildId="OTHER")
+    stats = await sync.run_once()
+    assert stats.left == 1 and stats.role_errors == 0
+
+@pytest.mark.asyncio
+async def test_deleted_character_cannot_register():
+    albion = FakePlayersAlbion()
+    with pytest.raises(RegistrationError, match="não foi encontrado"):
+        await confirm_in_guild(albion, server_config(), PlayerOption("apagado", "Fantasma", GUILD, None))
 
 @pytest.mark.asyncio
 async def test_sync_without_role_changes_nothing():

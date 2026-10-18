@@ -1,11 +1,12 @@
+from types import SimpleNamespace
 import pytest
 from app.integrations.albion.client import AlbionAPIError
 from app.modules.guild_registration.cog import (
     ConfirmGuildView, ConfirmResetView, GuildPanelView, GuildRegistrationCog, GuildResultsView, GuildSearchModal,
 )
-from app.modules.guild_registration.service import guild_options, link_guild, reset_guild
-from app.repositories.models import GuildLink, KillboardSettings, ServerConfig
-from tests.fakes import ACTIVATION, FakeInteraction, FakeSummaryChannel, config, event, make_tracker
+from app.modules.guild_registration.service import guild_options, link_guild, reset_guild, save_audit, validate_audit
+from app.repositories.models import AuditConfig, GuildLink, KillboardSettings, ServerConfig
+from tests.fakes import ACTIVATION, FakeChannel, FakeGuild, FakeInteraction, FakeSummaryChannel, bot_member, config, event, make_tracker
 
 SEARCH = {"guilds": [
     {"Id": "AAA", "Name": "TELETOM", "AllianceName": ""},
@@ -29,6 +30,14 @@ class FakeSearchAlbion:
 def make_cog(albion=None):
     tracker, _ = make_tracker()
     return GuildRegistrationCog(None, albion or FakeSearchAlbion(), tracker.repos, tracker), tracker
+
+def discord_guild(channels=None, **bot):
+    guild = FakeGuild(1, [], bot_member(**bot))
+    guild.channels = channels if channels is not None else {30: FakeChannel(30)}
+    return guild
+
+def panel_interaction(channels=None, **kwargs):
+    return FakeInteraction(guild=discord_guild(channels), **kwargs)
 
 # ---------- Regras ----------
 
@@ -78,6 +87,33 @@ async def test_reset_removes_guild_and_killboard_only_for_that_server():
     assert second.guild.guild_id == "BBB" and second.killboard_active
     assert await reset_guild(tracker.repos, tracker, 3) is None
 
+@pytest.mark.asyncio
+async def test_changing_guild_keeps_audit_and_reset_clears_it():
+    cog, tracker = make_cog()
+    await tracker.repos.save_config(config(guild="BBB"))
+    await save_audit(tracker.repos, 1, AuditConfig(30, 18, 0))
+    await link_guild(tracker.repos, tracker, 1, OTHER)
+    assert (await tracker.repos.get_config(1)).audit == AuditConfig(30, 18, 0)
+    await reset_guild(tracker.repos, tracker, 1)
+    assert (await tracker.repos.get_config(1)).audit == AuditConfig()
+
+def test_audit_validation_checks_channel_and_permissions():
+    guild = discord_guild({30: FakeChannel(30), 40: FakeChannel(40, send_messages=False, embed_links=False)})
+    assert validate_audit(AuditConfig(), guild) == []
+    assert validate_audit(AuditConfig(30, 9, 0), guild) == []
+    assert "não existe mais" in validate_audit(AuditConfig(99, 9, 0), guild)[0]
+    assert "enviar mensagens, incorporar links" in validate_audit(AuditConfig(40, 18, 0), guild)[0]
+    assert "horário do relatório" in validate_audit(AuditConfig(None, 24, 0), guild)[0]
+
+@pytest.mark.asyncio
+async def test_save_audit_is_isolated_by_server():
+    cog, tracker = make_cog()
+    assert (await save_audit(tracker.repos, 1, AuditConfig(30, 18, 0)))[0]
+    assert (await save_audit(tracker.repos, 1, AuditConfig(30, 18, 0)))[0] is False
+    await save_audit(tracker.repos, 2, AuditConfig(40, 7, 0))
+    first, second = await tracker.repos.get_config(1), await tracker.repos.get_config(2)
+    assert first.audit == AuditConfig(30, 18, 0) and second.audit == AuditConfig(40, 7, 0)
+
 def _scan(events):
     from app.modules.combat_tracker.service import ScanResult
     from datetime import timedelta
@@ -103,12 +139,16 @@ async def test_panel_shows_status_privately_and_reset_only_when_registered():
     await GuildRegistrationCog.cadastrar.callback(cog, interaction)
     content, kwargs = interaction.response.sent[0]
     assert kwargs["ephemeral"] and kwargs["view"].reset.disabled
+    labels = [item.label for item in kwargs["view"].children if getattr(item, "label", None)]
+    assert labels == ["Redefinir", "Pesquisar guilda", "Salvar verificação"]
     await tracker.repos.save_config(ServerConfig(1, GuildLink("BBB", "T E L E T O M", "LTM")))
     interaction = FakeInteraction()
     await GuildRegistrationCog.cadastrar.callback(cog, interaction)
     _, kwargs = interaction.response.sent[0]
     assert not kwargs["view"].reset.disabled
     assert any(field.value == "`BBB`" for field in kwargs["embed"].fields)
+    assert any(field.name == "Canal da verificação" for field in kwargs["embed"].fields)
+    assert any("09:00 (Brasília)" in field.value for field in kwargs["embed"].fields)
 
 @pytest.mark.asyncio
 async def test_search_defers_then_lists_results_without_choosing():
@@ -212,3 +252,40 @@ async def test_confirmed_reset_publishes_summary():
     cfg = await tracker.repos.get_config(1)
     assert cfg.guild is None and not cfg.killboard_active
     assert "cadastro redefinido" in channel.sent[0].title
+    assert (await tracker.repos.get_config(1)).audit == AuditConfig()
+
+@pytest.mark.asyncio
+async def test_saving_audit_publishes_summary_and_keeps_guild():
+    cog, tracker = make_cog()
+    await tracker.repos.save_config(ServerConfig(1, GuildLink("BBB", "T E L E T O M", "LTM")))
+    view = GuildPanelView(cog, 1, True, AuditConfig())
+    view.log_channel._values = [SimpleNamespace(id=30)]
+    await view.log_channel.callback(panel_interaction())
+    view.report_hour._values = ["18"]
+    await view.report_hour.callback(panel_interaction())
+    assert view.draft == AuditConfig(30, 18, 0)
+    channel = FakeSummaryChannel()
+    await view.save_audit_config.callback(panel_interaction(channel=channel))
+    cfg = await tracker.repos.get_config(1)
+    assert cfg.guild.guild_id == "BBB" and cfg.audit == AuditConfig(30, 18, 0)
+    fields = {field.name: field.value for field in channel.sent[0].fields}
+    assert "verificação de membros configurada" in channel.sent[0].title
+    assert fields["Canal da verificação"] == "<#30>" and fields["Relatório diário"] == "18:00 (Brasília)"
+
+@pytest.mark.asyncio
+async def test_invalid_audit_channel_is_not_saved_and_panel_stays_open():
+    cog, tracker = make_cog()
+    view = GuildPanelView(cog, 1, False, AuditConfig())
+    view.draft = AuditConfig(40, 9, 0)
+    attempt = panel_interaction(channels={40: FakeChannel(40, send_messages=False)})
+    await view.save_audit_config.callback(attempt)
+    assert "enviar mensagens" in attempt.private_texts()[0]
+    assert not view.finished and (await tracker.repos.get_config(1)) is None
+
+@pytest.mark.asyncio
+async def test_unchanged_audit_save_publishes_nothing():
+    cog, tracker = make_cog()
+    view = GuildPanelView(cog, 1, False, AuditConfig())
+    done = panel_interaction()
+    await view.save_audit_config.callback(done)
+    assert "Nada mudou" in done.private_texts()[0] and view.finished

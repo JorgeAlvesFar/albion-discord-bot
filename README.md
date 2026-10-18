@@ -3,7 +3,7 @@
 Bot para Discord integrado à API real do Albion Online. Um único bot (um único token) atende vários servidores Discord, cada um associado à sua guilda do Albion, com configurações, membros e notificações isolados por servidor.
 
 Funcionalidades:
-- **`/cadastrar`**: associa o servidor a uma guilda do Albion.
+- **`/cadastrar`**: associa o servidor a uma guilda do Albion e configura o canal/horário da verificação de membros.
 - **`/registrar-membros`**: define o cargo e a tag no apelido dos membros registrados.
 - **`/registrar`**: cada membro vincula o próprio personagem, validado na guilda.
 - **`/killboard`**: publica kills e mortes da guilda, com card de equipamentos.
@@ -47,18 +47,20 @@ Não compartilhe o `.env` nem publique o token.
 | `ALBION_MAX_CONCURRENCY` | `4` | Consultas simultâneas à API do Albion. |
 | `ALBION_RETRY_ATTEMPTS` | `3` | Tentativas por consulta à API do Albion. |
 | `COMBAT_POLL_SECONDS` | `45` | Intervalo **máximo** entre leituras do feed de combate (15 a 120 s). Com mais atividade, o coletor lê com mais frequência, até a cada 10 s. |
-| `MEMBER_SYNC_SECONDS` | `900` | Intervalo da verificação de quem saiu ou voltou para a guilda (300 a 3600 s). |
+| `MEMBER_SYNC_SECONDS` | `900` | Intervalo da verificação de quem não está mais na guilda (300 a 3600 s). |
 | `LOG_LEVEL` | `INFO` | Nível de log. `DEBUG` mostra o motivo de cada evento descartado. |
 
 ## Comandos
 Os comandos administrativos só aparecem, por padrão, para quem tem a permissão **Administrador**, e o bot confere essa permissão a cada clique. As etapas intermediárias são privadas; ao concluir uma operação que muda algo, o bot publica um resumo no canal do comando com a menção de quem a realizou (a menção não notifica ninguém). Painéis expiram depois de alguns minutos sem uso e avisam que expiraram; um segundo clique numa operação já concluída não a repete.
 
 ### `/cadastrar` (administradores)
-Associa o servidor a uma guilda do Albion.
-- O painel mostra a guilda atual (nome, aliança e Guild ID) e o estado do killboard. Botões: **Redefinir** (esquerda) e **Pesquisar guilda** (direita).
+Associa o servidor a uma guilda do Albion e configura as publicações da verificação de membros.
+- O painel mostra a guilda atual (nome, aliança e Guild ID), o estado do killboard, o canal da verificação e o horário do relatório diário (Brasília). Botões: **Redefinir**, **Pesquisar guilda** e **Salvar verificação**.
 - **Pesquisar guilda**: busca pelo nome na API real e lista os resultados com nome, aliança e Guild ID. A guilda nunca é escolhida automaticamente: é preciso selecionar e confirmar. Nomes parecidos podem ser guildas diferentes (ex.: "TELETOM" e "T E L E T O M").
-- Trocar a guilda **desativa e apaga a configuração do killboard** e descarta as notificações pendentes. Os vínculos de personagens não são transferidos. Confirmar a mesma guilda não muda nada.
-- **Redefinir** pede confirmação e remove a guilda e, junto, a configuração do killboard (que depende dela). A configuração de membros é mantida.
+- Trocar a guilda **desativa e apaga a configuração do killboard** e descarta as notificações pendentes. Os vínculos de personagens não são transferidos. O canal e o horário da verificação de membros **permanecem**. Confirmar a mesma guilda não muda nada.
+- **Canal da verificação** (opcional) e **horário do relatório diário** (0h–23h, Brasília; padrão 09:00): **Salvar verificação** grava só isso. Sem canal, as remoções de cargo continuam acontecendo, mas nada é publicado. O bot precisa poder ver o canal, enviar mensagens e incorporar links.
+- Com o canal configurado, o bot publica **na hora** quando a verificação desativa o registro de alguém que saiu da guilda, e **uma vez ao dia** no horário escolhido um relatório do que foi feito desde a última postagem.
+- **Redefinir** pede confirmação e remove a guilda e, junto, a configuração do killboard (que depende dela) e o canal/horário da verificação. A configuração de `/registrar-membros` é mantida.
 - Se a API do Albion falhar, a guilda já cadastrada é mantida.
 
 ### `/registrar-membros` (administradores)
@@ -74,7 +76,12 @@ Vincula o personagem do Albion à conta Discord. Todas as respostas são privada
 - Um personagem só pode estar vinculado a um membro por servidor; cada membro tem um único personagem (registrar outro pede confirmação para substituir).
 - Aplica o cargo e a tag configurados, se houver. Falhas ao aplicar o cargo ou o apelido são informadas, mas o vínculo continua válido.
 
-**Verificação periódica** (a cada `MEMBER_SYNC_SECONDS`): quem saiu da guilda perde o cargo configurado, mantendo o vínculo e o apelido; quem voltou recupera o cargo. Só muda algo com resposta válida da API: a ausência na lista de membros é confirmada pelo perfil do personagem, e falhas ou listas vazias não removem cargos. Também aplica o cargo atual a membros registrados antes de uma troca de cargo (o cargo antigo não é removido).
+**Verificação periódica** (a cada `MEMBER_SYNC_SECONDS`; a primeira roda depois do primeiro intervalo): para cada vínculo ativo, confere se o personagem ainda está na guilda cadastrada naquele servidor. Qualquer motivo conta: saiu, foi expulso, entrou em outra guilda, ficou sem guilda, apagou o personagem (a API responde 404) ou o servidor trocou a guilda em `/cadastrar`.
+- Quem não está mais na guilda **perde o cargo configurado** e tem o **vínculo desativado** (com data e motivo no log). O apelido não é alterado. Se houver canal configurado em `/cadastrar`, o bot publica o aviso nesse canal na hora.
+- Daí em diante essa pessoa é **ignorada**, mesmo que volte para a guilda: o cargo só volta com um novo `/registrar`, que não pede confirmação de substituição.
+- O perfil do personagem é a fonte de verdade; a lista de membros da guilda é só um atalho (quem está nela está na guilda). Sem resposta da API (indisponível, timeout), nada muda.
+- Se o bot não conseguir tirar o cargo (sem permissão Gerenciar cargos, ou cargo acima do dele), o vínculo continua ativo e o bot tenta de novo no próximo ciclo; o log mostra o motivo.
+- A verificação só remove cargos; nunca os adiciona.
 
 ### `/killboard` (administradores)
 Configura as notificações de combate. Exige a guilda cadastrada e é independente da configuração de membros.
@@ -105,7 +112,7 @@ Os problemas encontrados e corrigidos nesta versão:
 Observado na API real: o feed global é atualizado em lotes (ciclos sem nada novo seguidos de 70 a 240 eventos) e esteve com **4 minutos** e com **mais de 6 horas** de atraso em dias diferentes. Esse atraso é da API, não do bot, e aparece no log de cada ciclo.
 
 ## Limitações conhecidas
-- **Armazenamento em memória**: configurações, vínculos de personagens, notificações pendentes e o histórico de deduplicação se perdem ao reiniciar. Cargos e apelidos já aplicados no Discord permanecem. A migração para banco de dados é um escopo futuro.
+- **Armazenamento em memória**: configurações, vínculos de personagens, notificações pendentes, o histórico de deduplicação e o histórico da verificação de membros (para o relatório diário) se perdem ao reiniciar. Cargos e apelidos já aplicados no Discord permanecem. A migração para banco de dados é um escopo futuro.
 - **Atraso da API**: como só são publicados combates posteriores à ativação, com a API atrasada horas nada sai logo após ativar. Quem acabou de entrar ou sair da guilda também pode demorar a aparecer assim na API.
 - **Limite de paginação**: a API só permite ler ~1.020 eventos para trás por leitura (offset máximo 1000). Se entre duas leituras entrarem mais eventos que isso (bot parado, API fora do ar ou batalhas enormes), os mais antigos se perdem; o log avisa.
 - **Sem entrega exatamente uma vez**: se o Discord aceitar a mensagem e o bot falhar antes de registrar o envio, uma nova tentativa pode gerar duplicata.
@@ -118,7 +125,7 @@ Observado na API real: o feed global é atualizado em lotes (ciclos sem nada nov
 ## Testes
 Instale as dependências e execute `pytest -q`. Os testes usam API e Discord simulados; o bot em execução sempre usa a API real.
 
-Resultado nesta versão: **150 testes passando**, estáveis em execuções repetidas. Incluem testes de regressão dos defeitos do tracker (confirmados por mutação: reintroduzir cada defeito faz a suíte falhar) e testes integrados com os quatro módulos, dois servidores, falhas do Discord e da API, volumes acima do limite de paginação e reinício.
+Resultado nesta versão: **175 testes passando**, estáveis em execuções repetidas. Incluem testes de regressão dos defeitos do tracker (confirmados por mutação: reintroduzir cada defeito faz a suíte falhar) e testes integrados com os quatro módulos, dois servidores, falhas do Discord e da API, volumes acima do limite de paginação e reinício.
 
 Validações feitas contra a API real (fora dos testes automatizados): coleta e publicação de eventos reais com card e medição de latência; filtro temporal descartando combates anteriores à ativação; pesquisa de guildas e personagens; confirmação de guilda pelo perfil; verificação periódica sem remoção indevida de cargo.
 
@@ -129,12 +136,12 @@ Pendentes de validação no Discord real (dependem do deploy): uso dos comandos 
 - `app/main.py`: montagem do bot, comandos e tarefas.
 - `app/core/`: configuração e logs (em UTC).
 - `app/integrations/albion/`: cliente da API do Albion (`client.py`), preços de mercado (`prices.py`) e região (`regions.py`).
-- `app/repositories/models.py`: modelos. A configuração de cada servidor (`ServerConfig`) tem uma parte por módulo: `GuildLink` (`/cadastrar`), `MembersConfig` (`/registrar-membros`) e `KillboardConfig` (`/killboard`); cada módulo só altera a própria parte.
+- `app/repositories/models.py`: modelos. A configuração de cada servidor (`ServerConfig`) tem uma parte por módulo: `GuildLink` e `AuditConfig` (`/cadastrar`), `MembersConfig` (`/registrar-membros`) e `KillboardConfig` (`/killboard`); cada módulo só altera a própria parte.
 - `app/repositories/`: armazenamento em memória, um por assunto: `config_store.py` (configurações), `link_store.py` (vínculos de personagens, com exclusividade), `event_store.py` (fila de notificações, deduplicação e retenção). `memory.py` junta os três em `MemoryRepositories`.
 - `app/modules/common.py`: regras comuns dos comandos (permissão, painéis privados, resumo público).
 - `app/modules/guild_registration/`: `/cadastrar` (regras em `service.py`, interface em `cog.py`).
 - `app/modules/members_config/`: `/registrar-membros` (regras de tag, apelido e cargo em `service.py`, interface em `cog.py`).
-- `app/modules/member_registration/`: `/registrar` e a verificação periódica de membros.
+- `app/modules/member_registration/`: `/registrar`, a verificação periódica de membros (`service.py`) e as publicações de remoção/relatório diário (`audit.py`).
 - `app/modules/combat_tracker/`:
   - `events.py`: leitura dos eventos da API (horário em UTC, guilda dos envolvidos, itens).
   - `feed.py`: leitura do feed global com sobreposição e deduplicação.

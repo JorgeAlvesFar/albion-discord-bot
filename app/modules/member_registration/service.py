@@ -3,7 +3,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import discord
-from app.integrations.albion.client import AlbionAPIError
+from app.integrations.albion.client import AlbionAPIError, AlbionNotFoundError
 from app.modules.members_config.service import format_nickname, validate_role
 from app.repositories.memory import LinkConflict
 from app.repositories.models import MemberLink, ServerConfig
@@ -40,6 +40,8 @@ async def confirm_in_guild(albion, cfg: ServerConfig, option: PlayerOption) -> P
     """Confirma pela API (perfil atual do personagem) que ele está na guilda cadastrada."""
     try:
         player = await albion.get_player(option.player_id)
+    except AlbionNotFoundError as exc:
+        raise RegistrationError(f"O personagem **{option.name}** não foi encontrado na API do Albion. Confira o nome.") from exc
     except AlbionAPIError as exc:
         raise RegistrationError("A API do Albion não respondeu. Nada foi alterado; tente novamente em instantes.") from exc
     current = PlayerOption(str(player["Id"]), str(player.get("Name") or option.name), player.get("GuildId") or None, player.get("GuildName") or None)
@@ -52,7 +54,7 @@ async def confirm_in_guild(albion, cfg: ServerConfig, option: PlayerOption) -> P
     return current
 
 def active_link(link: MemberLink | None, cfg: ServerConfig) -> MemberLink | None:
-    return link if link and cfg.guild and link.albion_guild_id == cfg.guild.guild_id else None
+    return link if link and link.active and cfg.guild and link.albion_guild_id == cfg.guild.guild_id else None
 
 async def save_registration(repos, cfg: ServerConfig, user_id: int, player: PlayerOption) -> MemberLink:
     link = MemberLink(cfg.discord_guild_id, user_id, player.player_id, player.name, cfg.guild.guild_id)
@@ -110,21 +112,24 @@ async def apply_member_settings(member, cfg: ServerConfig, player_name: str) -> 
 class SyncStats:
     checked: int = 0
     left: int = 0
-    returned: int = 0
-    roles_added: int = 0
     roles_removed: int = 0
     unknown: int = 0
-    skipped_servers: int = 0
+    roster_unavailable: int = 0
+    role_errors: int = 0
 
 class MemberSync:
-    """Verificação periódica: quem saiu da guilda perde o cargo configurado; quem voltou o recupera.
+    """Verificação periódica: quem não está mais na guilda cadastrada perde o cargo e deixa de ser verificado.
 
-    O vínculo e o apelido são mantidos. Sem resposta válida da API, nada muda.
+    Vale qualquer motivo de saída (saiu, foi expulso, trocou de guilda, apagou o personagem, ou o servidor trocou a
+    guilda cadastrada). O perfil do personagem é a fonte de verdade; a lista de membros da guilda é só um atalho.
+    Quem sai tem o vínculo desativado e é ignorado daí em diante, mesmo que volte: só um novo /registrar devolve o
+    cargo. O apelido não é alterado. Sem resposta da API (indisponível, timeout), nada muda.
     """
 
-    def __init__(self, bot, albion, repos, interval_seconds: int = 900):
+    def __init__(self, bot, albion, repos, interval_seconds: int = 900, audit=None):
         self.bot, self.albion, self.repos = bot, albion, repos
         self.interval_seconds = interval_seconds
+        self.audit = audit
         self._task: asyncio.Task | None = None
 
     def start(self):
@@ -146,9 +151,9 @@ class MemberSync:
             try:
                 stats = await self.run_once()
                 log.info(
-                    "Sincronização de membros: %s vínculo(s) verificado(s), %s saíram, %s voltaram, cargos +%s/-%s, "
-                    "%s sem confirmação da API, %s servidor(es) sem resposta da API.",
-                    stats.checked, stats.left, stats.returned, stats.roles_added, stats.roles_removed, stats.unknown, stats.skipped_servers,
+                    "Sincronização de membros: %s vínculo(s) ativo(s) verificado(s), %s fora da guilda (desativados), %s cargo(s) removido(s), "
+                    "%s sem resposta da API (mantidos), %s lista(s) de membros indisponível(is), %s erro(s) de cargo.",
+                    stats.checked, stats.left, stats.roles_removed, stats.unknown, stats.roster_unavailable, stats.role_errors,
                 )
             except asyncio.CancelledError:
                 raise
@@ -156,70 +161,104 @@ class MemberSync:
                 log.exception("Erro não previsto na sincronização de membros.")
 
     async def run_once(self) -> SyncStats:
-        stats = SyncStats()
+        total = SyncStats()
         for cfg in await self.repos.all_configs():
             if not cfg.guild:
                 continue
-            links = [link for link in await self.repos.links_for(cfg.discord_guild_id) if active_link(link, cfg)]
-            if not links:
-                continue
-            try:
-                roster = await self.albion.get_guild_members(cfg.guild.guild_id)
-            except AlbionAPIError:
-                stats.skipped_servers += 1
-                log.warning("DiscordGuildId=%s: lista de membros de %s indisponível; nenhum cargo alterado.", cfg.discord_guild_id, cfg.guild.name)
-                continue
-            member_ids = {str(m.get("Id")) for m in roster if isinstance(m, dict) and m.get("Id")}
-            if not member_ids:
-                # Uma guilda com vínculos ativos não fica vazia de repente: trata como resposta suspeita.
-                stats.skipped_servers += 1
-                log.warning("DiscordGuildId=%s: a API devolveu a guilda %s sem membros; nenhum cargo alterado.", cfg.discord_guild_id, cfg.guild.name)
-                continue
-            for link in links:
-                stats.checked += 1
-                present = await self._is_present(link, cfg, member_ids)
-                if present is None:
-                    stats.unknown += 1
-                    continue
-                if present != link.in_guild:
-                    if present:
-                        stats.returned += 1
-                    else:
-                        stats.left += 1
-                    log.info(
-                        "DiscordGuildId=%s: %s (%s) %s a guilda %s.",
-                        cfg.discord_guild_id, link.player_name, link.player_id, "voltou para" if present else "saiu de", cfg.guild.name,
-                    )
-                link.in_guild, link.checked_at = present, datetime.now(timezone.utc)
-                await self._apply_role(cfg, link, present, stats)
-        return stats
+            stats = SyncStats()
+            links = [link for link in await self.repos.links_for(cfg.discord_guild_id) if link.active]
+            if links:
+                await self._check_server(cfg, links, stats)
+            if self.audit:
+                self.audit.record_cycle(cfg.discord_guild_id, stats.checked, stats.unknown, stats.roster_unavailable, stats.role_errors)
+            for name in vars(total):
+                setattr(total, name, getattr(total, name) + getattr(stats, name))
+        return total
 
-    async def _is_present(self, link: MemberLink, cfg: ServerConfig, member_ids: set[str]) -> bool | None:
-        if link.player_id in member_ids:
-            return True
-        # Ausente da lista: confirma pelo perfil do personagem antes de concluir que saiu.
+    async def _check_server(self, cfg: ServerConfig, links: list[MemberLink], stats: SyncStats) -> None:
+        member_ids = await self._roster(cfg, stats)
+        for link in links:
+            stats.checked += 1
+            present, reason = await self._membership(link, cfg, member_ids)
+            link.checked_at = datetime.now(timezone.utc)
+            if present is None:
+                stats.unknown += 1
+                log.info("DiscordGuildId=%s: %s (%s) não verificado: %s; cargo mantido.", cfg.discord_guild_id, link.player_name, link.player_id, reason)
+                continue
+            if present:
+                continue
+            # Só desativa depois de tirar o cargo: se a remoção falhar, tenta de novo no próximo ciclo.
+            removed, role_result = await self._remove_role(cfg, link, stats)
+            if not removed:
+                continue
+            link.deactivate(reason)
+            stats.left += 1
+            log.info(
+                "DiscordGuildId=%s: %s (%s) não está mais na guilda %s (%s); %s; vínculo desativado.",
+                cfg.discord_guild_id, link.player_name, link.player_id, cfg.guild.name, reason, role_result,
+            )
+            if self.audit:
+                await self.audit.record_removal(cfg, link, reason, role_result)
+
+    async def _roster(self, cfg: ServerConfig, stats: SyncStats) -> set[str] | None:
+        """Ids na lista de membros da guilda, ou None se ela não puder ser usada (aí cada perfil é consultado)."""
+        try:
+            roster = await self.albion.get_guild_members(cfg.guild.guild_id)
+        except AlbionAPIError:
+            stats.roster_unavailable += 1
+            log.warning("DiscordGuildId=%s: lista de membros de %s indisponível; verificando pelo perfil de cada personagem.", cfg.discord_guild_id, cfg.guild.name)
+            return None
+        member_ids = {str(m.get("Id")) for m in roster if isinstance(m, dict) and m.get("Id")}
+        if not member_ids:
+            # Lista vazia é suspeita (a API às vezes devolve vazio): não serve para concluir nada.
+            stats.roster_unavailable += 1
+            log.warning("DiscordGuildId=%s: a API devolveu a guilda %s sem membros; verificando pelo perfil de cada personagem.", cfg.discord_guild_id, cfg.guild.name)
+            return None
+        return member_ids
+
+    async def _membership(self, link: MemberLink, cfg: ServerConfig, member_ids: set[str] | None) -> tuple[bool | None, str]:
+        """(está na guilda cadastrada?, motivo). None = não deu para confirmar: nada muda."""
+        if link.albion_guild_id != cfg.guild.guild_id:
+            return False, "vínculo feito com outra guilda; o servidor trocou a guilda cadastrada"
+        if member_ids is not None and link.player_id in member_ids:
+            return True, "na lista de membros"
+        # Fora da lista (ou lista indisponível): o perfil atual do personagem decide.
         try:
             player = await self.albion.get_player(link.player_id)
+        except AlbionNotFoundError:
+            return False, "personagem não existe mais na API"
         except AlbionAPIError:
-            return None
-        return (player.get("GuildId") or None) == cfg.guild.guild_id
+            return None, "API indisponível"
+        guild_id = player.get("GuildId") or None
+        if guild_id == cfg.guild.guild_id:
+            return True, "perfil na guilda"
+        return False, f"perfil na guilda {player.get('GuildName')}" if guild_id else "perfil sem guilda"
 
-    async def _apply_role(self, cfg: ServerConfig, link: MemberLink, present: bool, stats: SyncStats) -> None:
+    async def _remove_role(self, cfg: ServerConfig, link: MemberLink, stats: SyncStats) -> tuple[bool, str]:
+        """Tira o cargo configurado. (True, resultado) se não há mais nada a remover; (False, motivo) se falhou (tentar de novo)."""
         if not cfg.members.role_id:
-            return
+            return True, "nenhum cargo configurado em /registrar-membros"
         guild = self.bot.get_guild(cfg.discord_guild_id)
         if guild is None:
-            return
+            return False, "servidor indisponível para o bot"
         member = guild.get_member(link.user_id)
+        if member is None:
+            return True, "o membro não está mais no servidor Discord"
         role = guild.get_role(cfg.members.role_id)
-        if member is None or role is None or validate_role(role, guild.me):
-            return
+        if role is None:
+            return True, "o cargo configurado não existe mais"
+        if role not in member.roles:
+            return True, f"o membro já não tinha o cargo <@&{role.id}>"
+        error = validate_role(role, guild.me)
+        if error:
+            stats.role_errors += 1
+            log.warning("DiscordGuildId=%s: não foi possível remover o cargo de %s: %s", cfg.discord_guild_id, link.user_id, error)
+            return False, error
         try:
-            if present and role not in member.roles:
-                await member.add_roles(role, reason="Personagem do Albion voltou para a guilda")
-                stats.roles_added += 1
-            elif not present and role in member.roles:
-                await member.remove_roles(role, reason="Personagem do Albion saiu da guilda")
-                stats.roles_removed += 1
+            await member.remove_roles(role, reason="Personagem do Albion não está na guilda cadastrada")
         except discord.HTTPException:
-            log.exception("DiscordGuildId=%s: falha ao ajustar o cargo de %s.", cfg.discord_guild_id, link.user_id)
+            stats.role_errors += 1
+            log.exception("DiscordGuildId=%s: falha ao remover o cargo de %s.", cfg.discord_guild_id, link.user_id)
+            return False, "o Discord recusou a remoção"
+        stats.roles_removed += 1
+        return True, f"cargo <@&{role.id}> removido"

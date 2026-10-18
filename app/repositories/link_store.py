@@ -25,13 +25,13 @@ class LinkStore:
     async def save_link(self, link: MemberLink) -> LinkConflict | MemberLink | None:
         """Grava o vínculo, substituindo o anterior do mesmo usuário.
 
-        Devolve LinkConflict se o personagem já estiver vinculado (na mesma guilda) a outro usuário do servidor;
+        Devolve LinkConflict se o personagem já tiver vínculo ativo (na mesma guilda) com outro usuário do servidor;
         senão, o vínculo substituído (ou None). A verificação e a gravação ocorrem sob a mesma trava.
         """
         async with self._links_lock:
             for (gid, user_id), other in self._links.items():
                 if (
-                    gid == link.discord_guild_id and user_id != link.user_id
+                    gid == link.discord_guild_id and user_id != link.user_id and other.active
                     and other.player_id == link.player_id and other.albion_guild_id == link.albion_guild_id
                 ):
                     return LinkConflict(user_id)

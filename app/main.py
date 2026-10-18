@@ -11,6 +11,7 @@ from app.integrations.albion.prices import AlbionPriceClient
 from app.integrations.albion.regions import prices_url_for
 from app.modules.guild_registration.cog import GuildRegistrationCog
 from app.modules.members_config.cog import MembersConfigCog
+from app.modules.member_registration.audit import MembershipAudit
 from app.modules.member_registration.cog import MemberRegistrationCog
 from app.modules.member_registration.service import MemberSync
 from app.modules.combat_tracker.card import KillCardRenderer
@@ -40,7 +41,8 @@ class AlbionBot(commands.Bot):
             renderer=self.card_renderer, prices=self.prices,
         )
         await self.add_cog(GuildRegistrationCog(self, self.albion, self.repos, self.tracker))
-        self.member_sync = MemberSync(self, self.albion, self.repos, settings.member_sync_seconds)
+        self.audit = MembershipAudit(self, self.repos)
+        self.member_sync = MemberSync(self, self.albion, self.repos, settings.member_sync_seconds, audit=self.audit)
         await self.add_cog(MembersConfigCog(self, self.repos))
         await self.add_cog(MemberRegistrationCog(self, self.albion, self.repos))
         await self.add_cog(CombatCog(self, self.repos, self.tracker))
@@ -48,10 +50,11 @@ class AlbionBot(commands.Bot):
         synced = await self.tree.sync()
         self.tracker.start()
         self.member_sync.start()
+        self.audit.start()
         log.info("Comandos de aplicação sincronizados: %s.", ", ".join(f"/{command.name}" for command in synced))
 
     async def close(self):
-        for task_owner in (getattr(self, "tracker", None), getattr(self, "member_sync", None)):
+        for task_owner in (getattr(self, "tracker", None), getattr(self, "member_sync", None), getattr(self, "audit", None)):
             if task_owner:
                 await task_owner.close()
         for client in (getattr(self, "albion", None), getattr(self, "card_renderer", None), getattr(self, "prices", None)):

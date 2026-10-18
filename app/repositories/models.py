@@ -15,6 +15,20 @@ class GuildLink:
     alliance_name: str | None = None
 
 @dataclass(frozen=True)
+class AuditConfig:
+    """/cadastrar: canal onde a verificação de membros publica remoções e o relatório diário, e o horário do relatório.
+
+    O horário é no fuso de Brasília (UTC-3). Sem canal, nada é publicado (as remoções continuam acontecendo).
+    """
+    channel_id: int | None = None
+    report_hour: int = 9
+    report_minute: int = 0
+
+    @property
+    def report_time_text(self) -> str:
+        return f"{self.report_hour:02d}:{self.report_minute:02d}"
+
+@dataclass(frozen=True)
 class MembersConfig:
     """/registrar-membros: opções independentes; vazias = não atribuir cargo / não alterar o apelido."""
     role_id: int | None = None
@@ -83,6 +97,7 @@ class ServerConfig:
     guild: GuildLink | None = None
     members: MembersConfig = MembersConfig()
     killboard: KillboardConfig = KillboardConfig()
+    audit: AuditConfig = AuditConfig()
     updated_at: datetime = field(default_factory=_utcnow)
 
     @property
@@ -97,7 +112,9 @@ class ServerConfig:
 class MemberLink:
     """Vínculo entre um usuário Discord e um personagem do Albion, num servidor.
 
-    Só conta como ativo enquanto `albion_guild_id` for a guilda cadastrada no servidor: trocar a guilda não transfere vínculos.
+    Conta enquanto estiver ativo e `albion_guild_id` for a guilda cadastrada no servidor (trocar a guilda não transfere
+    vínculos). Quando a verificação periódica confirma que o personagem não está mais na guilda, o cargo é removido e o
+    vínculo é desativado: a partir daí ele é ignorado, e só um novo /registrar volta a valer.
     """
     discord_guild_id: int
     user_id: int
@@ -105,9 +122,13 @@ class MemberLink:
     player_name: str
     albion_guild_id: str
     linked_at: datetime = field(default_factory=_utcnow)
-    # Última situação confirmada pela API: o personagem estava na guilda? Só muda com resposta válida da API.
-    in_guild: bool = True
+    active: bool = True
+    deactivated_at: datetime | None = None
+    deactivation_reason: str | None = None
     checked_at: datetime = field(default_factory=_utcnow)
+
+    def deactivate(self, reason: str) -> None:
+        self.active, self.deactivated_at, self.deactivation_reason = False, _utcnow(), reason
 
 # Estados de uma notificação. PUBLISHED, DISCARDED e FAILED são finais.
 PENDING, PUBLISHED, DISCARDED, FAILED = "PENDING", "PUBLISHED", "DISCARDED", "FAILED"
